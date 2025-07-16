@@ -1,5 +1,15 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BangPatterns                #-}
+{-# LANGUAGE DataKinds                   #-}
+{-# LANGUAGE DeriveGeneric               #-}
+{-# LANGUAGE FlexibleContexts            #-}
+{-# LANGUAGE GADTs                       #-}
+{-# LANGUAGE ScopedTypeVariables         #-}
+{-# LANGUAGE TemplateHaskell             #-}
+{-# LANGUAGE TypeApplications            #-}
+{-# LANGUAGE ViewPatterns                #-}
+{-# OPTIONS_GHC -Wno-orphans             #-}
 
 module DQN where
 
@@ -10,13 +20,13 @@ import Data.Ord (comparing)
 import System.Random
 import GHC.Generics
 import Gym.Environment
+import Gym.Core
+import qualified System.Random.MWC as MWC
 
 -- DQN Network Architecture
 data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int }
   deriving (Show, Eq)
 
-data DQN = DQN { fc1 :: T.Linear, fc2 :: T.Linear, fc3 :: T.Linear }
-  deriving (Generic, Show)
 
 type DQNNet = Network 4 64 64 2
 type DQNState = R 4
@@ -59,7 +69,7 @@ main :: IO ()
 main = MWC.withSystemRandom $ \g -> do
   putStrLn "Initializing neural network..."
   net0 <- MWC.uniformR @(Network 4 64 64 2) (-0.5, 0.5) g
-  env <- Gym.Environment.make "CartPole-v1"
+  env <- Gym.Environment.makeEnv "CartPole-v1"
   initialState <- Gym.Environment.reset env
   case initialState of
     Left err -> do
