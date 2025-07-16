@@ -40,10 +40,16 @@ module NeuralNetwork (
     runNetNormal,
     runNetwork,
     
+    -- * Training
+    trainStep,
+    trainList,
+    averageLoss,
+    
     -- * Loss functions
     crossEntropyNormal,
     crossEntropy,
-    netErr
+    netErr,
+
 ) where
 
 import           Control.DeepSeq
@@ -264,3 +270,31 @@ instance ( KnownNat i, KnownNat h1, KnownNat h2, KnownNat o
          ) => MWC.Variate (Network i h1 h2 o) where
     uniform g = Net <$> MWC.uniform g <*> MWC.uniform g <*> MWC.uniform g
     uniformR (l, h) g = (\x -> x * (h - l) + l) <$> MWC.uniform g
+
+trainStep
+    :: forall i h1 h2 o. (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o)
+    => Double             -- ^ learning rate
+    -> R i                -- ^ input
+    -> R o                -- ^ target
+    -> Network i h1 h2 o  -- ^ initial network
+    -> Network i h1 h2 o
+trainStep r !x !targ !n = n - realToFrac r * gradBP (netErr x targ) n
+{-# INLINE trainStep #-}
+
+trainList
+    :: forall i h1 h2 o. (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o)
+    => Double             -- ^ learning rate
+    -> [(R i, R o)]       -- ^ input and target pairs
+    -> Network i h1 h2 o  -- ^ initial network
+    -> Network i h1 h2 o
+trainList r d n = foldr (\(input, target) n' -> trainStep r input target n') n d
+{-# INLINE trainList #-}
+
+averageLoss
+    :: forall i h1 h2 o. (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o)
+    => [(R i, R o)]       -- ^ input and target pairs
+    -> Network i h1 h2 o  -- ^ initial network
+    -> Double
+averageLoss d net = sum (map (\(i, o) -> evalBP (netErr i o) net) d) / fromIntegral (length d)
+  
+{-# INLINE averageLoss #-}
