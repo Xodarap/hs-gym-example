@@ -53,21 +53,16 @@ module NeuralNetwork (
 ) where
 
 import           Control.DeepSeq
-import           Control.Monad
-import           Data.Foldable
-import           Data.Proxy
 import           GHC.Generics                        (Generic)
 import           GHC.TypeLits
 import           Lens.Micro
 import           Lens.Micro.TH
 import           Numeric.Backprop
 import           Numeric.Backprop.Class
--- import           Numeric.Backprop.Num
 import           Numeric.LinearAlgebra.Static
 import qualified Numeric.LinearAlgebra               as HM
 import           Numeric.OneLiner
 import qualified System.Random.MWC                   as MWC
-import qualified System.Random.MWC.Distributions     as MWC
 
 -- | A neural network layer with weights and biases
 data Layer i o = Layer 
