@@ -38,6 +38,7 @@ data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int 
 
 
 type DQNNet = Network 4 64 64 1
+type DQNActor = Network 4 64 64 2
 type DQNState = R 4
 type DQNOutput = R 1
 type Reward = Double
@@ -62,6 +63,14 @@ reluVec v = dvmap (\x -> max 0 x) v
 -- Run network to get Q-value prediction (no softmax, using ReLU)
 runNetForQ :: DQNNet -> DQNState -> R 1
 runNetForQ net input = runLayerNormal (net ^. nLayer3)
+                     . reluVec
+                     . runLayerNormal (net ^. nLayer2)
+                     . reluVec
+                     . runLayerNormal (net ^. nLayer1)
+                     $ input
+
+runNetForActor :: DQNActor -> DQNState -> R 2
+runNetForActor net input = runLayerNormal (net ^. nLayer3)
                      . reluVec
                      . runLayerNormal (net ^. nLayer2)
                      . reluVec
@@ -423,68 +432,60 @@ testDifferentTargets = do
         ) targets
 
 main :: IO ()
-main = do
-  -- First run the utilities demo
-  demoUtilities
-  
-  -- Test synthetic learning
-  testSyntheticLearning getRandomNet evalCritic trainOneStep computeLoss
-  
-  -- Then run the full training
-  do
-    putStrLn "Initializing neural network with Glorot initialization..."
-    net0 <- glorotInitNetwork
-    env <- Gym.Environment.makeEnv "CartPole-v1"
-    case env of
-      Left err -> do
-        putStrLn $ "Environment error: " ++ show err
-        return ()
-      Right envHandle -> do
-        initialState <- Gym.Environment.reset envHandle
-        case initialState of
-          Left err -> do
-            putStrLn $ "Reset error: " ++ show err
-            return ()
-          Right obs -> do
-            case parseObservation obs of
-              Nothing -> do
-                putStrLn $ "Parsing returned nothing"
-                return ()
-              Just state -> do
-                let stateVec = vectorFromList state
-                -- Sample initial trajectory to show before training
-                trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
-                
-                -- putStrLn "\n=== INITIAL TRAJECTORY (BEFORE TRAINING) ==="
-                -- putStrLn $ showTrajectory trajectory
-                
-                -- putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
-                -- putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
-                
-                -- putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
-                -- putStrLn $ showQValueComparison net0 0.99 trajectory
-                
-                -- Train network for 100 epochs with reduced learning rate
-                putStrLn "\n=== TRAINING FOR 100 EPOCHS ==="
-                trainedNet <- trainForEpochs net0 0.001 0.99 1000 envHandle
-                putStrLn "Training completed!"
-                
-                -- Sample trajectory with trained network
-                finalTrajectory <- trajectoryFromEnv envHandle trainedNet
-                
-                -- putStrLn "\n=== FINAL TRAJECTORY (AFTER TRAINING) ==="
-                -- putStrLn $ showTrajectory finalTrajectory
-                
-                putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
-                putStrLn $ showQValueComparison trainedNet 0.99 finalTrajectory
-                
-                -- Show MSE loss improvement on original trajectory
-                let originalMSELoss = averageMSELoss net0 0.99 trajectory
-                let trainedMSELoss = averageMSELoss trainedNet 0.99 trajectory
-                putStrLn $ "\nOriginal MSE loss: " ++ show originalMSELoss
-                putStrLn $ "Trained MSE loss: " ++ show trainedMSELoss
-                putStrLn $ "Loss improvement: " ++ show (originalMSELoss - trainedMSELoss)
-                
-                closeEnv envHandle
-                return ()
+main = do  
+  putStrLn "Initializing neural network with Glorot initialization..."
+  net0 <- glorotInitNetwork
+  env <- Gym.Environment.makeEnv "CartPole-v1"
+  case env of
+    Left err -> do
+      putStrLn $ "Environment error: " ++ show err
+      return ()
+    Right envHandle -> do
+      initialState <- Gym.Environment.reset envHandle
+      case initialState of
+        Left err -> do
+          putStrLn $ "Reset error: " ++ show err
+          return ()
+        Right obs -> do
+          case parseObservation obs of
+            Nothing -> do
+              putStrLn $ "Parsing returned nothing"
+              return ()
+            Just state -> do
+              let stateVec = vectorFromList state
+              -- Sample initial trajectory to show before training
+              trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
+              
+              -- putStrLn "\n=== INITIAL TRAJECTORY (BEFORE TRAINING) ==="
+              -- putStrLn $ showTrajectory trajectory
+              
+              -- putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
+              -- putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
+              
+              -- putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
+              -- putStrLn $ showQValueComparison net0 0.99 trajectory
+              
+              -- Train network for 100 epochs with reduced learning rate
+              putStrLn "\n=== TRAINING FOR 100 EPOCHS ==="
+              trainedNet <- trainForEpochs net0 0.001 0.99 1000 envHandle
+              putStrLn "Training completed!"
+              
+              -- Sample trajectory with trained network
+              finalTrajectory <- trajectoryFromEnv envHandle trainedNet
+              
+              -- putStrLn "\n=== FINAL TRAJECTORY (AFTER TRAINING) ==="
+              -- putStrLn $ showTrajectory finalTrajectory
+              
+              putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
+              putStrLn $ showQValueComparison trainedNet 0.99 finalTrajectory
+              
+              -- Show MSE loss improvement on original trajectory
+              let originalMSELoss = averageMSELoss net0 0.99 trajectory
+              let trainedMSELoss = averageMSELoss trainedNet 0.99 trajectory
+              putStrLn $ "\nOriginal MSE loss: " ++ show originalMSELoss
+              putStrLn $ "Trained MSE loss: " ++ show trainedMSELoss
+              putStrLn $ "Loss improvement: " ++ show (originalMSELoss - trainedMSELoss)
+              
+              closeEnv envHandle
+              return ()
         
