@@ -418,7 +418,7 @@ main = do
                 
                 -- Train network for 100 epochs with reduced learning rate
                 putStrLn "\n=== TRAINING FOR 100 EPOCHS ==="
-                trainedNet <- trainForEpochs net0 0.001 0.99 100 envHandle
+                trainedNet <- trainForEpochs net0 0.001 0.99 3 envHandle
                 putStrLn "Training completed!"
                 
                 -- Sample trajectory with trained network
