@@ -267,8 +267,10 @@ trainForEpochs net learningRate gamma epochs envHandle = do
       if (101 - epochs) `mod` 10 == 0
         then do
           let sampleQ = runNetForQ newNet (vector [0.0, 0.0, 0.0, 0.0])
+          let huberLoss = averageHuberLoss newNet 1.0 gamma trajectory
           putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
-                     ", Sample Q-values: " ++ show (extract sampleQ)
+                     ", Sample Q-values: " ++ show (extract sampleQ) ++
+                     ", Huber Loss: " ++ show huberLoss
         else return ()
       
       trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
