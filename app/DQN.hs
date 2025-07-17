@@ -27,7 +27,7 @@ import qualified Numeric.LinearAlgebra as LA
 import Lens.Micro
 import Numeric.Backprop
 import GHC.TypeLits
-import Control.Monad (foldM)
+import Control.Monad (foldM, replicateM)
 import Debug.Trace (trace)
 import Data.Proxy
 
@@ -222,7 +222,7 @@ trainStepMSE learningRate net input target =
       err = evalBP (\netVar -> mseErr input target netVar) net
       retVal = net - realToFrac learningRate * gradBP (mseErr input target) net
       debugInfo = "Predicted: " ++ (show predicted) ++ " Actual: " ++ (show target) ++ " Error: " ++ (show $ err)
-  in trace debugInfo retVal
+  in retVal --trace debugInfo retVal
 
 -- Train network on trajectory with MSE loss
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
@@ -305,6 +305,152 @@ glorotInitNetwork = do
   layer2 <- glorotInitLayer @64 @64
   layer3 <- glorotInitLayer @64 @1
   return $ Net layer1 layer2 layer3
+
+-- ============================================================================
+-- SYNTHETIC DATASET FOR TESTING
+-- ============================================================================
+
+-- | Simple synthetic dataset where target = sum of squares of inputs
+-- f(x1, x2, x3, x4) = x1^2 + x2^2 + x3^2 + x4^2
+generateSumSquares :: DQNState -> Double
+generateSumSquares state = 
+  let vals = LA.toList $ extract state
+  in sum $ map (\x -> x * x) vals
+
+-- | Linear combination: f(x1, x2, x3, x4) = 2*x1 + 3*x2 - x3 + 0.5*x4
+generateLinearCombo :: DQNState -> Double
+generateLinearCombo state =
+  let [x1, x2, x3, x4] = LA.toList $ extract state
+  in 2*x1 + 3*x2 - x3 + 0.5*x4
+
+-- | Quadratic with cross terms: f(x1, x2, x3, x4) = x1*x2 + x3*x4 + x1^2
+generateQuadratic :: DQNState -> Double
+generateQuadratic state =
+  let [x1, x2, x3, x4] = LA.toList $ extract state
+  in x1*x2 + x3*x4 + x1*x1
+
+-- | Generate random training data
+generateTrainingData :: Int -> (DQNState -> Double) -> IO [(DQNState, Double)]
+generateTrainingData numSamples targetFunc = do
+  states <- replicateM numSamples $ do
+    x1 <- randomRIO (-2.0, 2.0)
+    x2 <- randomRIO (-2.0, 2.0) 
+    x3 <- randomRIO (-2.0, 2.0)
+    x4 <- randomRIO (-2.0, 2.0)
+    return $ vector [x1, x2, x3, x4]
+  let targets = map targetFunc states
+  return $ zip states targets
+
+-- | Test specific patterns for sum of squares function
+testPatterns :: [(DQNState, Double, String)]
+testPatterns = 
+  [ (vector [1.0, 0.0, 0.0, 0.0], 1.0, "unit_x1")
+  , (vector [0.0, 1.0, 0.0, 0.0], 1.0, "unit_x2") 
+  , (vector [0.0, 0.0, 1.0, 0.0], 1.0, "unit_x3")
+  , (vector [0.0, 0.0, 0.0, 1.0], 1.0, "unit_x4")
+  , (vector [1.0, 1.0, 1.0, 1.0], 4.0, "all_ones")
+  , (vector [2.0, 0.0, 0.0, 0.0], 4.0, "double_x1")
+  , (vector [0.0, 0.0, 0.0, 0.0], 0.0, "zeros")
+  , (vector [-1.0, 1.0, -1.0, 1.0], 4.0, "alternating")
+  ]
+
+-- | Train network on synthetic dataset
+trainOnSyntheticData :: DQNNet -> Double -> Int -> [(DQNState, Double)] -> IO DQNNet
+trainOnSyntheticData net learningRate epochs trainingData = do
+  putStrLn $ "Training on " ++ show (length trainingData) ++ " samples for " ++ show epochs ++ " epochs"
+  
+  let trainEpoch currentNet epochNum = do
+        -- Shuffle and train on all data
+        let trainedNet = foldl (\n (state, target) -> 
+              trainOneStep n state target learningRate) currentNet trainingData
+        
+        -- Report progress every 50 epochs
+        if epochNum `mod` 50 == 0 then do
+          let avgLoss = sum [computeLoss trainedNet state target | (state, target) <- trainingData] 
+                       / fromIntegral (length trainingData)
+          putStrLn $ "Epoch " ++ show epochNum ++ ", Average Loss: " ++ show avgLoss
+        else return ()
+        
+        return trainedNet
+  
+  foldM trainEpoch net [1..epochs]
+
+-- | Test network on specific patterns
+testOnPatterns :: DQNNet -> [(DQNState, Double, String)] -> IO ()
+testOnPatterns net patterns = do
+  putStrLn "\n=== Testing on Specific Patterns ==="
+  mapM_ testPattern patterns
+  where
+    testPattern (state, expected, name) = do
+      let predicted = evalCritic net state
+      let error = abs (predicted - expected)
+      let relativeError = if expected /= 0 then error / abs expected * 100 else error * 100
+      putStrLn $ name ++ ": expected=" ++ show expected ++ 
+                ", predicted=" ++ show predicted ++ 
+                ", error=" ++ show error ++
+                ", rel_error=" ++ show relativeError ++ "%"
+
+-- | Test a specific function
+testFunction :: String -> (DQNState -> Double) -> [(DQNState, Double, String)] -> IO ()
+testFunction funcName targetFunc patterns = do
+  putStrLn $ "\n--- Testing " ++ funcName ++ " ---"
+  
+  -- Generate training data
+  trainingData <- generateTrainingData 1000 targetFunc
+  testData <- generateTrainingData 100 targetFunc
+  
+  -- Initialize network
+  net0 <- getRandomNet
+  
+  -- Test before training
+  putStrLn "\nBefore training:"
+  testOnPatterns net0 patterns
+  
+  -- Train network
+  trainedNet <- trainOnSyntheticData net0 0.01 200 trainingData
+  
+  -- Test after training
+  putStrLn "\nAfter training:"
+  testOnPatterns trainedNet patterns
+  
+  -- Test on unseen data
+  putStrLn "\n=== Testing on Unseen Data ==="
+  let avgTestLoss = sum [computeLoss trainedNet state target | (state, target) <- testData] 
+                   / fromIntegral (length testData)
+  putStrLn $ "Average test loss: " ++ show avgTestLoss
+  
+  -- Show some test examples
+  putStrLn "\nSample predictions on test data:"
+  mapM_ (\(state, expected) -> do
+          let predicted = evalCritic trainedNet state
+          let vals = LA.toList $ extract state
+          putStrLn $ "Input: " ++ show vals ++ " → Expected: " ++ show expected ++ 
+                     ", Predicted: " ++ show predicted ++ 
+                     ", Error: " ++ show (abs (predicted - expected))
+        ) (take 3 testData)
+
+-- | Test patterns for linear combination function
+linearComboPatterns :: [(DQNState, Double, String)]
+linearComboPatterns = 
+  [ (vector [1.0, 0.0, 0.0, 0.0], 2.0, "unit_x1_*2")
+  , (vector [0.0, 1.0, 0.0, 0.0], 3.0, "unit_x2_*3") 
+  , (vector [0.0, 0.0, 1.0, 0.0], -1.0, "unit_x3_*(-1)")
+  , (vector [0.0, 0.0, 0.0, 1.0], 0.5, "unit_x4_*0.5")
+  , (vector [1.0, 1.0, 1.0, 1.0], 4.5, "all_ones")
+  , (vector [0.0, 0.0, 0.0, 0.0], 0.0, "zeros")
+  , (vector [2.0, 1.0, -1.0, 2.0], 9.0, "mixed")
+  ]
+
+-- | Comprehensive test of synthetic learning
+testSyntheticLearning :: IO ()
+testSyntheticLearning = do
+  putStrLn "=== Testing DQN Learning on Synthetic Data ==="
+  
+  -- Test sum of squares function (nonlinear)
+  testFunction "Sum of Squares: f(x) = x1² + x2² + x3² + x4²" generateSumSquares testPatterns
+  
+  -- Test linear combination (should be easier)
+  testFunction "Linear Combination: f(x) = 2*x1 + 3*x2 - x3 + 0.5*x4" generateLinearCombo linearComboPatterns
 
 -- ============================================================================
 -- UTILITY FUNCTIONS FOR GHCI DEBUGGING
@@ -424,6 +570,9 @@ main :: IO ()
 main = do
   -- First run the utilities demo
   demoUtilities
+  
+  -- Test synthetic learning
+  testSyntheticLearning
   
   -- Then run the full training
   do
