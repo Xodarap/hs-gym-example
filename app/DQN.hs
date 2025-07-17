@@ -23,6 +23,7 @@ import           Numeric.LinearAlgebra.Static
 import Data.Aeson (Value(Number, Array))
 import qualified Data.Vector as V
 import qualified Numeric.LinearAlgebra as LA
+import Lens.Micro
 
 -- DQN Network Architecture
 data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int }
@@ -48,9 +49,18 @@ vectorFromList :: [Double] -> R 4
 vectorFromList [a, b, c, d] = vector [a, b, c, d]
 vectorFromList _ = vector [0.0, 0.0, 0.0, 0.0]
 
+-- Run network without softmax for Q-values
+runNetForQ :: DQNNet -> DQNState -> R 2
+runNetForQ net input = runLayerNormal (net ^. nLayer3)
+                     . logistic
+                     . runLayerNormal (net ^. nLayer2)
+                     . logistic
+                     . runLayerNormal (net ^. nLayer1)
+                     $ input
+
 getAction :: DQNNet -> DQNState -> IO Action
 getAction net input = do
-  let output = runNetNormal net input
+  let output = runNetForQ net input
   doRandom <- randomRIO (0.0, 1.0 :: Double)
   if doRandom < 0.1
     then do
@@ -129,7 +139,7 @@ calculateQTargets net gamma trajectory =
             newVals = [if i == idx then target else vals LA.! i | i <- [0,1]]
         in vector newVals
   in map (\(state, action, discountedReward) -> 
-      let currentQ = runNetNormal net state
+      let currentQ = runNetForQ net state
           actionIdx = actionToInt action
           -- Use discounted reward as target (no need to add gamma * next_q since it's already discounted)
           updatedQ = updateQValue currentQ actionIdx discountedReward
@@ -143,7 +153,7 @@ showQValueComparison net gamma trajectory =
   in unlines $ "Q-Value Predictions vs Targets:" : comparisons
   where
     showComparison stepNum (state, action, discountedReward) = 
-      let predictedQ = runNetNormal net state
+      let predictedQ = runNetForQ net state
           actionIdx = actionToInt action
           predictedValue = (extract predictedQ) LA.! actionIdx
           target = discountedReward
