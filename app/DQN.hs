@@ -88,7 +88,13 @@ makeDiscountedTrajectory gamma trajectory =
   in DT $ inner trajectory
 
 showDiscountedTrajectory :: DiscountedTrajectory -> String
-showDiscountedTrajectory (DT t) = showTrajectory t
+showDiscountedTrajectory (DT t) = unlines $ zipWith showDiscountedStep [(1 :: Int)..] t
+  where
+    showDiscountedStep stepNum (state, action, discountedReward) = 
+      "Step " ++ show stepNum ++ ": " ++
+      "State=" ++ show (extract state) ++ ", " ++
+      "Action=" ++ show action ++ ", " ++
+      "Discounted Reward=" ++ show discountedReward
 showTrajectory :: Trajectory -> String
 showTrajectory trajectory = unlines $ zipWith showStep [(1 :: Int)..] trajectory
   where
@@ -113,26 +119,39 @@ actionToInt :: Action -> Int
 actionToInt (Action (Number n)) = round $ realToFrac n
 actionToInt _ = 0
 
--- Calculate Q-value targets from trajectory
+-- Calculate Q-value targets from discounted trajectory
 calculateQTargets :: DQNNet -> Double -> Trajectory -> [(DQNState, R 2)]
-calculateQTargets net gamma trajectory = go trajectory
-  where
-    go [] = []
-    go [(state, action, reward)] = [(state, updateQValue (runNetNormal net state) (actionToInt action) reward)] -- Terminal state
-    go ((state, action, reward) : rest@((nextState, _, _) : _)) = 
+calculateQTargets net gamma trajectory = 
+  let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
+      updateQValue :: R 2 -> Int -> Double -> R 2
+      updateQValue qvals idx target = 
+        let vals = extract qvals
+            newVals = [if i == idx then target else vals LA.! i | i <- [0,1]]
+        in vector newVals
+  in map (\(state, action, discountedReward) -> 
       let currentQ = runNetNormal net state
-          nextQ = runNetNormal net nextState
           actionIdx = actionToInt action
-          maxNextQ = LA.maxElement $ extract nextQ
-          targetQ = reward + gamma * maxNextQ
-          updatedQ = updateQValue currentQ actionIdx targetQ
-      in (state, updatedQ) : go rest
-    
-    updateQValue :: R 2 -> Int -> Double -> R 2
-    updateQValue qvals idx target = 
-      let vals = extract qvals
-          newVals = [if i == idx then target else vals LA.! i | i <- [0,1]]
-      in vector newVals
+          -- Use discounted reward as target (no need to add gamma * next_q since it's already discounted)
+          updatedQ = updateQValue currentQ actionIdx discountedReward
+      in (state, updatedQ)) discountedTrajectory
+
+-- Show predicted vs actual Q-values
+showQValueComparison :: DQNNet -> Double -> Trajectory -> String
+showQValueComparison net gamma trajectory = 
+  let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
+      comparisons = zipWith showComparison [(1 :: Int)..] discountedTrajectory
+  in unlines $ "Q-Value Predictions vs Targets:" : comparisons
+  where
+    showComparison stepNum (state, action, discountedReward) = 
+      let predictedQ = runNetNormal net state
+          actionIdx = actionToInt action
+          predictedValue = (extract predictedQ) LA.! actionIdx
+          target = discountedReward
+      in "Step " ++ show stepNum ++ ": " ++
+         "Action=" ++ show actionIdx ++ ", " ++
+         "Predicted Q=" ++ show predictedValue ++ ", " ++
+         "Target Q=" ++ show target ++ ", " ++
+         "Error=" ++ show (abs (predictedValue - target))
 
 -- Train network on trajectory
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
@@ -187,18 +206,29 @@ main = MWC.withSystemRandom $ \g -> do
               let stateVec = vectorFromList state
               -- Sample trajectory and train network
               trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
-              putStrLn "\nTrajectory:"
+              
+              putStrLn "\n=== ORIGINAL TRAJECTORY ==="
               putStrLn $ showTrajectory trajectory
               
+              putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
+              putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
+              
+              putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
+              putStrLn $ showQValueComparison net0 0.99 trajectory
+              
               -- Train network on trajectory
-              trainedNet <- trainForEpochs net0 0.01 0.99 100 envHandle
-              putStrLn "\nTraining completed. Network updated."
+              let trainedNet = trainOnTrajectory net0 0.01 0.99 trajectory
+              putStrLn "\n=== TRAINING COMPLETED ==="
+              
+              putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
+              putStrLn $ showQValueComparison trainedNet 0.99 trajectory
               
               -- Show loss improvement
               let originalLoss = averageLoss (calculateQTargets net0 0.99 trajectory) net0
               let trainedLoss = averageLoss (calculateQTargets trainedNet 0.99 trajectory) trainedNet
-              putStrLn $ "Original loss: " ++ show originalLoss
+              putStrLn $ "\nOriginal loss: " ++ show originalLoss
               putStrLn $ "Trained loss: " ++ show trainedLoss
+              putStrLn $ "Loss improvement: " ++ show (originalLoss - trainedLoss)
               
               closeEnv envHandle
               return ()
