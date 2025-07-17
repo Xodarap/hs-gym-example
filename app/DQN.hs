@@ -14,16 +14,12 @@
 module Main where
 
 import NeuralNetwork
-import Control.Monad (replicateM, when)
-import Data.List (maximumBy)
-import Data.Ord (comparing)
 import System.Random
 -- import GHC.Generics
 import Gym.Environment
 import Gym.Core
 import qualified System.Random.MWC as MWC
 import           Numeric.LinearAlgebra.Static
-import qualified Numeric.LinearAlgebra               as HM
 import Data.Aeson (Value(Number, Array))
 import qualified Data.Vector as V
 import qualified Numeric.LinearAlgebra as LA
@@ -37,7 +33,7 @@ type DQNNet = Network 4 64 64 2
 type DQNState = R 4
 type DQNOutput = R 2
 type Reward = Double
-type Trajectory = [(DQNState, DQNOutput, Reward)]
+type Trajectory = [(DQNState, Action, Reward)]
 newtype DiscountedTrajectory = DT Trajectory
 
 -- Gym.Environment.step 
@@ -76,31 +72,30 @@ makeTransition env action = do
 
 sampleTrajectory :: DQNNet -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
 sampleTrajectory net input transition = do
-  let output = runNetNormal net input
   action <- getAction net input
   (nextState, reward, done) <- transition action
   if done
-    then return [(input, output, reward)]
+    then return [(input, action, reward)]
     else do
       nextTrajectory <- sampleTrajectory net nextState transition
-      return ((input, output, reward) : nextTrajectory)
+      return ((input, action, reward) : nextTrajectory)
 
 makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
 makeDiscountedTrajectory gamma trajectory = 
-  let inner ((ti, to, tr):u:us) = let r@((ui, uo, ur):rs) = inner (u:us) in (ti, to, gamma * ur + tr) : r
-      inner (x:xs) = [x]
+  let inner ((ti, to, treward):u:us) = let r@((_, _, ur):_) = inner (u:us) in (ti, to, gamma * ur + treward) : r
+      inner [x] = [x]
       inner [] = []
   in DT $ inner trajectory
 
 showDiscountedTrajectory :: DiscountedTrajectory -> String
 showDiscountedTrajectory (DT t) = showTrajectory t
 showTrajectory :: Trajectory -> String
-showTrajectory trajectory = unlines $ zipWith showStep [1..] trajectory
+showTrajectory trajectory = unlines $ zipWith showStep [(1 :: Int)..] trajectory
   where
-    showStep stepNum (state, output, reward) = 
+    showStep stepNum (state, action, reward) = 
       "Step " ++ show stepNum ++ ": " ++
       "State=" ++ show (extract state) ++ ", " ++
-      "Q-values=" ++ show (extract output) ++ ", " ++
+      "Action=" ++ show (action) ++ ", " ++
       "Reward=" ++ show reward
 
 parseObservation :: Observation -> Maybe [Double]
@@ -141,6 +136,7 @@ main = MWC.withSystemRandom $ \g -> do
               let stateVec = vectorFromList state
               trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
               putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
+              closeEnv envHandle
               return ()
         
 
