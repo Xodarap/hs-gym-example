@@ -54,12 +54,16 @@ vectorFromList :: [Double] -> R 4
 vectorFromList [a, b, c, d] = vector [a, b, c, d]
 vectorFromList _ = vector [0.0, 0.0, 0.0, 0.0]
 
--- Run network to get Q-value prediction (no softmax)
+-- ReLU activation function for static vectors
+reluVec :: (KnownNat n) => R n -> R n
+reluVec v = dvmap (\x -> max 0 x) v
+
+-- Run network to get Q-value prediction (no softmax, using ReLU)
 runNetForQ :: DQNNet -> DQNState -> R 1
 runNetForQ net input = runLayerNormal (net ^. nLayer3)
-                     . logistic
+                     . reluVec
                      . runLayerNormal (net ^. nLayer2)
-                     . logistic
+                     . reluVec
                      . runLayerNormal (net ^. nLayer1)
                      $ input
 
@@ -183,15 +187,22 @@ hasNaN net =
   in any isNaN (LA.toList $ extract testOutput)
 
 
--- Run network for Q-value prediction with backprop (no softmax)
+-- ReLU activation function for backpropagation
+reluBackpropVec :: (KnownNat n, Reifies s W) => BVar s (R n) -> BVar s (R n)
+reluBackpropVec = liftOp1 . op1 $ \v -> 
+  let reluVec = dvmap (\x -> max 0 x) v
+      grad g = dvmap (\x -> if x > 0 then 1 else 0) v * g
+  in (reluVec, grad)
+
+-- Run network for Q-value prediction with backprop (no softmax, using ReLU)
 runNetworkForQ :: (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o, Reifies s W)
                => BVar s (Network i h1 h2 o)
                -> R i
                -> BVar s (R o)
 runNetworkForQ n input = runLayer (n ^^. nLayer3)
-                       . logistic
+                       . reluBackpropVec
                        . runLayer (n ^^. nLayer2)
-                       . logistic
+                       . reluBackpropVec
                        . runLayer (n ^^. nLayer1)
                        . constVar
                        $ input
