@@ -32,9 +32,9 @@ data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int 
   deriving (Show, Eq)
 
 
-type DQNNet = Network 4 64 64 2
+type DQNNet = Network 4 64 64 1
 type DQNState = R 4
-type DQNOutput = R 2
+type DQNOutput = R 1
 type Reward = Double
 type Trajectory = [(DQNState, Action, Reward)]
 newtype DiscountedTrajectory = DT Trajectory
@@ -42,17 +42,16 @@ newtype DiscountedTrajectory = DT Trajectory
 -- Gym.Environment.step 
 -- :: Environment -> Action -> IO (Either GymError StepResult)
 
-argmax :: R 2 -> Int
-argmax v = 
-  let vals = extract v
-  in if vals LA.! 0 > vals LA.! 1 then 0 else 1
+-- Since we only have one output, we'll use random action selection
+randomAction :: IO Int
+randomAction = randomRIO (0, 1)
 
 vectorFromList :: [Double] -> R 4
 vectorFromList [a, b, c, d] = vector [a, b, c, d]
 vectorFromList _ = vector [0.0, 0.0, 0.0, 0.0]
 
--- Run network without softmax for Q-values
-runNetForQ :: DQNNet -> DQNState -> R 2
+-- Run network to get Q-value prediction (no softmax)
+runNetForQ :: DQNNet -> DQNState -> R 1
 runNetForQ net input = runLayerNormal (net ^. nLayer3)
                      . logistic
                      . runLayerNormal (net ^. nLayer2)
@@ -63,12 +62,9 @@ runNetForQ net input = runLayerNormal (net ^. nLayer3)
 getAction :: DQNNet -> DQNState -> IO Action
 getAction net input = do
   let output = runNetForQ net input
-  doRandom <- randomRIO (0.0, 1.0 :: Double)
-  if doRandom < 0.1
-    then do
-      randomAction <- randomRIO (0, 1 :: Int)
-      return $ Action $ Number $ fromIntegral randomAction
-    else return $ Action $ Number $ fromIntegral $ argmax output
+  -- Always use random action since we're training a critic, not a policy
+  randomActionInt <- randomAction
+  return $ Action $ Number $ fromIntegral randomActionInt
 
 makeTransition :: Environment -> Action -> IO (DQNState, Reward, Bool)
 makeTransition env action = do
@@ -132,20 +128,14 @@ actionToInt (Action (Number n)) = round $ realToFrac n
 actionToInt _ = 0
 
 -- Calculate Q-value targets from discounted trajectory
-calculateQTargets :: DQNNet -> Double -> Trajectory -> [(DQNState, R 2)]
+calculateQTargets :: DQNNet -> Double -> Trajectory -> [(DQNState, R 1)]
 calculateQTargets net gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
-      updateQValue :: R 2 -> Int -> Double -> R 2
-      updateQValue qvals idx target = 
-        let vals = extract qvals
-            newVals = [if i == idx then target else vals LA.! i | i <- [0,1]]
-        in vector newVals
   in map (\(state, action, discountedReward) -> 
-      let currentQ = runNetForQ net state
-          actionIdx = actionToInt action
-          -- Use discounted reward as target (no need to add gamma * next_q since it's already discounted)
-          updatedQ = updateQValue currentQ actionIdx discountedReward
-      in (state, updatedQ)) discountedTrajectory
+      -- The network now predicts a single Q-value for the action taken
+      -- The target is the discounted reward
+      let target = vector [discountedReward]
+      in (state, target)) discountedTrajectory
 
 -- Calculate average MSE loss for trajectory
 averageMSELoss :: DQNNet -> Double -> Trajectory -> Double
@@ -156,8 +146,7 @@ averageMSELoss net gamma trajectory =
   where
     calculateLoss (state, action, discountedReward) = 
       let predictedQ = runNetForQ net state
-          actionIdx = actionToInt action
-          predictedValue = (extract predictedQ) LA.! actionIdx
+          predictedValue = (extract predictedQ) LA.! 0  -- Single output
           target = discountedReward
           err = predictedValue - target
       in err * err  -- MSE = (predicted - target)^2
@@ -173,7 +162,7 @@ showQValueComparison net gamma trajectory =
     showComparison stepNum (state, action, discountedReward) = 
       let predictedQ = runNetForQ net state
           actionIdx = actionToInt action
-          predictedValue = (extract predictedQ) LA.! actionIdx
+          predictedValue = (extract predictedQ) LA.! 0  -- Single output
           target = discountedReward
           err = predictedValue - target
           mseErr = err * err
@@ -189,78 +178,39 @@ hasNaN net =
   let testOutput = runNetForQ net (vector [0.0, 0.0, 0.0, 0.0])
   in any isNaN (LA.toList $ extract testOutput)
 
--- Huber loss function (more robust than MSE)
-huberLoss :: Double -> Double -> Double -> Double
-huberLoss delta predicted target = 
-  let error = abs (predicted - target)
-  in if error <= delta
-     then 0.5 * error * error
-     else delta * (error - 0.5 * delta)
 
--- Huber loss with backpropagation
-huberLossGrad :: Double -> Double -> Double -> Double
-huberLossGrad delta predicted target = 
-  let error = predicted - target
-      absError = abs error
-  in if absError <= delta
-     then error  -- Gradient is just the error for quadratic part
-     else delta * signum error  -- Gradient is delta * sign(error) for linear part
-
--- Clamp Q-values to prevent explosion
-clampQValues :: R 2 -> R 2
-clampQValues qvals = 
-  let vals = extract qvals
-      clampedVals = map (\x -> max (-100) (min 100 x)) (LA.toList vals)
-  in vector clampedVals
-
--- Huber loss function for backpropagation
-huberLossBackprop :: Double -> R 2 -> R 2 -> Double
-huberLossBackprop delta predicted target = 
-  let predVals = LA.toList $ extract predicted
-      targetVals = LA.toList $ extract target  
-      losses = zipWith (huberLoss delta) predVals targetVals
-  in sum losses
-
--- Huber loss training step using MSE approximation
--- Since we can't easily integrate Huber loss with the existing backprop system,
--- we'll use a more robust approach by clamping the error before applying MSE
-trainStepHuber :: Double -> Double -> DQNNet -> DQNState -> R 2 -> DQNNet
-trainStepHuber learningRate delta net input target = 
-  let predicted = runNetForQ net input
-      -- Clamp errors to simulate Huber loss behavior
-      predVals = LA.toList $ extract predicted
-      targetVals = LA.toList $ extract target
-      clampedTargets = zipWith (clampError delta) predVals targetVals
-      clampedTargetVec = vector clampedTargets
-  in trainStep learningRate input clampedTargetVec net
-  where
-    -- Clamp the error to delta, then adjust target accordingly
-    clampError delta pred targ = 
-      let err = pred - targ
-          clampedErr = max (-delta) (min delta err)
-      in pred - clampedErr  -- Target = prediction - clamped_error
+-- Run network for Q-value prediction with backprop (no softmax)
+runNetworkForQ :: (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o, Reifies s W)
+               => BVar s (Network i h1 h2 o)
+               -> R i
+               -> BVar s (R o)
+runNetworkForQ n input = runLayer (n ^^. nLayer3)
+                       . logistic
+                       . runLayer (n ^^. nLayer2)
+                       . logistic
+                       . runLayer (n ^^. nLayer1)
+                       . constVar
+                       $ input
 
 -- MSE loss for Q-value regression
 mseErr :: (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o, Reifies s W)
        => R i -> R o -> BVar s (Network i h1 h2 o) -> BVar s Double
 mseErr input target net = 
-  let predicted = runNetwork net input
+  let predicted = runNetworkForQ net input
       diff = predicted - constVar target
   in 0.5 * (diff <.>! diff)  -- MSE = 0.5 * ||predicted - target||^2
 
 -- MSE-based training step for Q-value regression
-trainStepMSE :: Double -> DQNNet -> DQNState -> R 2 -> DQNNet
+trainStepMSE :: Double -> DQNNet -> DQNState -> R 1 -> DQNNet
 trainStepMSE learningRate net input target = 
   net - realToFrac learningRate * gradBP (mseErr input target) net
 
--- Train network on trajectory with MSE loss and safety checks
+-- Train network on trajectory with MSE loss
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
 trainOnTrajectory net learningRate gamma trajectory = 
   let trainingPairs = calculateQTargets net gamma trajectory
-      -- Clamp target Q-values to prevent explosion
-      clampedPairs = map (\(state, qvals) -> (state, clampQValues qvals)) trainingPairs
       -- Use MSE loss for Q-value regression
-      newNet = foldl (\n (state, target) -> trainStepMSE learningRate n state target) net clampedPairs
+      newNet = foldl (\n (state, target) -> trainStepMSE learningRate n state target) net trainingPairs
   in if hasNaN newNet
      then net  -- Return original network if NaN detected
      else newNet
@@ -299,7 +249,7 @@ trainForEpochs net learningRate gamma epochs envHandle = do
           let sampleQ = runNetForQ newNet (vector [0.0, 0.0, 0.0, 0.0])
           let mseLoss = averageMSELoss newNet gamma trajectory
           putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
-                     ", Sample Q-values: " ++ show (extract sampleQ) ++
+                     ", Sample Q-value: " ++ show (extract sampleQ) ++
                      ", MSE Loss: " ++ show mseLoss
         else return ()
       
@@ -308,7 +258,7 @@ trainForEpochs net learningRate gamma epochs envHandle = do
 main :: IO ()
 main = MWC.withSystemRandom $ \g -> do
   putStrLn "Initializing neural network..."
-  net0 <- MWC.uniformR @(Network 4 64 64 2) (-0.5, 0.5) g
+  net0 <- MWC.uniformR @(Network 4 64 64 1) (-0.5, 0.5) g
   env <- Gym.Environment.makeEnv "CartPole-v1"
   case env of
     Left err -> do
