@@ -9,6 +9,7 @@
 {-# LANGUAGE TemplateHaskell             #-}
 {-# LANGUAGE TypeApplications            #-}
 {-# LANGUAGE ViewPatterns                #-}
+{-# LANGUAGE AllowAmbiguousTypes         #-}
 {-# OPTIONS_GHC -Wno-orphans             #-}
 
 module Main where
@@ -28,6 +29,7 @@ import Numeric.Backprop
 import GHC.TypeLits
 import Control.Monad (foldM)
 import Debug.Trace (trace)
+import Data.Proxy
 
 -- DQN Network Architecture
 data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int }
@@ -262,15 +264,45 @@ trainForEpochs net learningRate gamma epochs envHandle = do
       trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
 
 -- ============================================================================
+-- GLOROT INITIALIZATION
+-- ============================================================================
+
+-- | Glorot (Xavier) initialization for a layer
+-- For a layer with fanIn inputs and fanOut outputs, 
+-- weights are initialized from uniform distribution [-limit, limit]
+-- where limit = sqrt(6 / (fanIn + fanOut))
+glorotInitLayer :: forall i o. (KnownNat i, KnownNat o) => IO (Layer i o)
+glorotInitLayer = do
+  let fanIn = fromIntegral $ natVal (Proxy @i)
+  let fanOut = fromIntegral $ natVal (Proxy @o)
+  let limit = sqrt (6.0 / (fanIn + fanOut)) :: Double
+  
+  gen <- MWC.createSystemRandom
+  -- Generate uniform [0,1] and scale to [-limit, limit]
+  uniformWeights <- MWC.uniform gen :: IO (L o i)
+  uniformBiases <- MWC.uniform gen :: IO (R o)
+  
+  let weights = uniformWeights * konst (2 * limit) - konst limit  -- Scale to [-limit, limit]
+  let biases = uniformBiases * konst (2 * limit) - konst limit    -- Scale to [-limit, limit]
+  
+  return $ Layer weights biases
+
+-- | Glorot initialization for the entire network
+glorotInitNetwork :: IO DQNNet
+glorotInitNetwork = do
+  layer1 <- glorotInitLayer @4 @64
+  layer2 <- glorotInitLayer @64 @64
+  layer3 <- glorotInitLayer @64 @1
+  return $ Net layer1 layer2 layer3
+
+-- ============================================================================
 -- UTILITY FUNCTIONS FOR GHCI DEBUGGING
 -- ============================================================================
 
--- | Create a random network for testing (use this in ghci)
+-- | Create a random network for testing with Glorot initialization (use this in ghci)
 -- Example: net <- getRandomNet
 getRandomNet :: IO DQNNet
-getRandomNet = do
-  g <- MWC.createSystemRandom
-  MWC.uniformR @(Network 4 64 64 1) (-0.5, 0.5) g
+getRandomNet = glorotInitNetwork
 
 -- | Evaluate critic on a given state
 evalCritic :: DQNNet -> DQNState -> Double
@@ -383,9 +415,9 @@ main = do
   demoUtilities
   
   -- Then run the full training
-  MWC.withSystemRandom $ \g -> do
-    putStrLn "Initializing neural network..."
-    net0 <- MWC.uniformR @(Network 4 64 64 1) (-0.5, 0.5) g
+  do
+    putStrLn "Initializing neural network with Glorot initialization..."
+    net0 <- glorotInitNetwork
     env <- Gym.Environment.makeEnv "CartPole-v1"
     case env of
       Left err -> do
