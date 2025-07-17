@@ -37,6 +37,8 @@ type DQNNet = Network 4 64 64 2
 type DQNState = R 4
 type DQNOutput = R 2
 type Reward = Double
+type Trajectory = [(DQNState, DQNOutput, Reward)]
+newtype DiscountedTrajectory = DT Trajectory
 
 -- Gym.Environment.step 
 -- :: Environment -> Action -> IO (Either GymError StepResult)
@@ -72,7 +74,7 @@ makeTransition env action = do
           Nothing -> return (vector [0.0, 0.0, 0.0, 0.0], stepReward result, stepTerminated result || stepTruncated result)
           Just state -> return (vectorFromList state, stepReward result, stepTerminated result || stepTruncated result)
 
-sampleTrajectory :: DQNNet -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO [(DQNState, DQNOutput, Reward)]
+sampleTrajectory :: DQNNet -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
 sampleTrajectory net input transition = do
   let output = runNetNormal net input
   action <- getAction net input
@@ -82,6 +84,9 @@ sampleTrajectory net input transition = do
     else do
       nextTrajectory <- sampleTrajectory net nextState transition
       return ((input, output, reward) : nextTrajectory)
+
+makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
+makeDiscountedTrajectory gamma trajectory = DT $ reverse $ snd $ foldl (\(d, l) (i, o, r) -> (d * gamma, (i, o, d * r) : l)) (1,[]) trajectory
 
 parseObservation :: Observation -> Maybe [Double]
 parseObservation (Observation (Array arr)) = 
