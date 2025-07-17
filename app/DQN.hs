@@ -24,6 +24,8 @@ import Data.Aeson (Value(Number, Array))
 import qualified Data.Vector as V
 import qualified Numeric.LinearAlgebra as LA
 import Lens.Micro
+import Numeric.Backprop
+import GHC.TypeLits
 
 -- DQN Network Architecture
 data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int }
@@ -145,9 +147,9 @@ calculateQTargets net gamma trajectory =
           updatedQ = updateQValue currentQ actionIdx discountedReward
       in (state, updatedQ)) discountedTrajectory
 
--- Calculate average Huber loss for trajectory
-averageHuberLoss :: DQNNet -> Double -> Double -> Trajectory -> Double
-averageHuberLoss net delta gamma trajectory = 
+-- Calculate average MSE loss for trajectory
+averageMSELoss :: DQNNet -> Double -> Trajectory -> Double
+averageMSELoss net gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
       losses = map calculateLoss discountedTrajectory
   in sum losses / fromIntegral (length losses)
@@ -157,27 +159,29 @@ averageHuberLoss net delta gamma trajectory =
           actionIdx = actionToInt action
           predictedValue = (extract predictedQ) LA.! actionIdx
           target = discountedReward
-      in huberLoss delta predictedValue target
+          err = predictedValue - target
+      in err * err  -- MSE = (predicted - target)^2
 
--- Show predicted vs actual Q-values with Huber loss
+-- Show predicted vs actual Q-values with MSE loss
 showQValueComparison :: DQNNet -> Double -> Trajectory -> String
 showQValueComparison net gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
       comparisons = zipWith showComparison [(1 :: Int)..] discountedTrajectory
-      avgHuberLoss = averageHuberLoss net 1.0 gamma trajectory
-  in unlines $ ("Q-Value Predictions vs Targets (Average Huber Loss: " ++ show avgHuberLoss ++ "):") : comparisons
+      avgMSELoss = averageMSELoss net gamma trajectory
+  in unlines $ ("Q-Value Predictions vs Targets (Average MSE Loss: " ++ show avgMSELoss ++ "):") : comparisons
   where
     showComparison stepNum (state, action, discountedReward) = 
       let predictedQ = runNetForQ net state
           actionIdx = actionToInt action
           predictedValue = (extract predictedQ) LA.! actionIdx
           target = discountedReward
-          huberErr = huberLoss 1.0 predictedValue target
+          err = predictedValue - target
+          mseErr = err * err
       in "Step " ++ show stepNum ++ ": " ++
          "Action=" ++ show actionIdx ++ ", " ++
          "Predicted Q=" ++ show predictedValue ++ ", " ++
          "Target Q=" ++ show target ++ ", " ++
-         "Huber Loss=" ++ show huberErr
+         "MSE Loss=" ++ show mseErr
 
 -- Check if network output has NaN values
 hasNaN :: DQNNet -> Bool
@@ -209,28 +213,54 @@ clampQValues qvals =
       clampedVals = map (\x -> max (-100) (min 100 x)) (LA.toList vals)
   in vector clampedVals
 
--- Custom training step using Huber loss
+-- Huber loss function for backpropagation
+huberLossBackprop :: Double -> R 2 -> R 2 -> Double
+huberLossBackprop delta predicted target = 
+  let predVals = LA.toList $ extract predicted
+      targetVals = LA.toList $ extract target  
+      losses = zipWith (huberLoss delta) predVals targetVals
+  in sum losses
+
+-- Huber loss training step using MSE approximation
+-- Since we can't easily integrate Huber loss with the existing backprop system,
+-- we'll use a more robust approach by clamping the error before applying MSE
 trainStepHuber :: Double -> Double -> DQNNet -> DQNState -> R 2 -> DQNNet
 trainStepHuber learningRate delta net input target = 
   let predicted = runNetForQ net input
-      -- Calculate Huber loss gradients for each output
+      -- Clamp errors to simulate Huber loss behavior
       predVals = LA.toList $ extract predicted
       targetVals = LA.toList $ extract target
-      gradients = zipWith (huberLossGrad delta) predVals targetVals
-      gradientVec = vector gradients
-      -- Use the gradient as the "error" for backpropagation
-      -- This approximates the Huber loss gradient
-      errorTarget = predicted - (realToFrac learningRate) * gradientVec
-  in trainStep learningRate input errorTarget net
+      clampedTargets = zipWith (clampError delta) predVals targetVals
+      clampedTargetVec = vector clampedTargets
+  in trainStep learningRate input clampedTargetVec net
+  where
+    -- Clamp the error to delta, then adjust target accordingly
+    clampError delta pred targ = 
+      let err = pred - targ
+          clampedErr = max (-delta) (min delta err)
+      in pred - clampedErr  -- Target = prediction - clamped_error
 
--- Train network on trajectory with Huber loss and safety checks
+-- MSE loss for Q-value regression
+mseErr :: (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o, Reifies s W)
+       => R i -> R o -> BVar s (Network i h1 h2 o) -> BVar s Double
+mseErr input target net = 
+  let predicted = runNetwork net input
+      diff = predicted - constVar target
+  in 0.5 * (diff <.>! diff)  -- MSE = 0.5 * ||predicted - target||^2
+
+-- MSE-based training step for Q-value regression
+trainStepMSE :: Double -> DQNNet -> DQNState -> R 2 -> DQNNet
+trainStepMSE learningRate net input target = 
+  net - realToFrac learningRate * gradBP (mseErr input target) net
+
+-- Train network on trajectory with MSE loss and safety checks
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
 trainOnTrajectory net learningRate gamma trajectory = 
   let trainingPairs = calculateQTargets net gamma trajectory
       -- Clamp target Q-values to prevent explosion
       clampedPairs = map (\(state, qvals) -> (state, clampQValues qvals)) trainingPairs
-      -- Use Huber loss with delta = 1.0 (common value for DQN)
-      newNet = foldl (\n (state, target) -> trainStepHuber learningRate 1.0 n state target) net clampedPairs
+      -- Use MSE loss for Q-value regression
+      newNet = foldl (\n (state, target) -> trainStepMSE learningRate n state target) net clampedPairs
   in if hasNaN newNet
      then net  -- Return original network if NaN detected
      else newNet
@@ -267,10 +297,10 @@ trainForEpochs net learningRate gamma epochs envHandle = do
       if (101 - epochs) `mod` 10 == 0
         then do
           let sampleQ = runNetForQ newNet (vector [0.0, 0.0, 0.0, 0.0])
-          let huberLoss = averageHuberLoss newNet 1.0 gamma trajectory
+          let mseLoss = averageMSELoss newNet gamma trajectory
           putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
                      ", Sample Q-values: " ++ show (extract sampleQ) ++
-                     ", Huber Loss: " ++ show huberLoss
+                     ", MSE Loss: " ++ show mseLoss
         else return ()
       
       trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
@@ -323,12 +353,12 @@ main = MWC.withSystemRandom $ \g -> do
               putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
               putStrLn $ showQValueComparison trainedNet 0.99 finalTrajectory
               
-              -- Show Huber loss improvement on original trajectory
-              let originalHuberLoss = averageHuberLoss net0 1.0 0.99 trajectory
-              let trainedHuberLoss = averageHuberLoss trainedNet 1.0 0.99 trajectory
-              putStrLn $ "\nOriginal Huber loss: " ++ show originalHuberLoss
-              putStrLn $ "Trained Huber loss: " ++ show trainedHuberLoss
-              putStrLn $ "Loss improvement: " ++ show (originalHuberLoss - trainedHuberLoss)
+              -- Show MSE loss improvement on original trajectory
+              let originalMSELoss = averageMSELoss net0 0.99 trajectory
+              let trainedMSELoss = averageMSELoss trainedNet 0.99 trajectory
+              putStrLn $ "\nOriginal MSE loss: " ++ show originalMSELoss
+              putStrLn $ "Trained MSE loss: " ++ show trainedMSELoss
+              putStrLn $ "Loss improvement: " ++ show (originalMSELoss - trainedMSELoss)
               
               closeEnv envHandle
               return ()
