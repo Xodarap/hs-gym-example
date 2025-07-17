@@ -26,6 +26,8 @@ import qualified Numeric.LinearAlgebra as LA
 import Lens.Micro
 import Numeric.Backprop
 import GHC.TypeLits
+import Control.Monad (foldM)
+import Debug.Trace (trace)
 
 -- DQN Network Architecture
 data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int }
@@ -203,7 +205,11 @@ mseErr input target net =
 -- MSE-based training step for Q-value regression
 trainStepMSE :: Double -> DQNNet -> DQNState -> R 1 -> DQNNet
 trainStepMSE learningRate net input target = 
-  net - realToFrac learningRate * gradBP (mseErr input target) net
+  let predicted = evalBP (\netVar -> runNetworkForQ netVar input) net
+      err = evalBP (\netVar -> mseErr input target netVar) net
+      retVal = net - realToFrac learningRate * gradBP (mseErr input target) net
+      debugInfo = "Predicted: " ++ (show predicted) ++ " Actual: " ++ (show target) ++ " Error: " ++ (show $ err)
+  in trace debugInfo retVal
 
 -- Train network on trajectory with MSE loss
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
@@ -255,61 +261,182 @@ trainForEpochs net learningRate gamma epochs envHandle = do
       
       trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
 
+-- ============================================================================
+-- UTILITY FUNCTIONS FOR GHCI DEBUGGING
+-- ============================================================================
+
+-- | Create a random network for testing (use this in ghci)
+-- Example: net <- getRandomNet
+getRandomNet :: IO DQNNet
+getRandomNet = do
+  g <- MWC.createSystemRandom
+  MWC.uniformR @(Network 4 64 64 1) (-0.5, 0.5) g
+
+-- | Evaluate critic on a given state
+evalCritic :: DQNNet -> DQNState -> Double
+evalCritic net state = 
+  let output = runNetForQ net state
+  in (extract output) LA.! 0
+
+-- | Train network for one step on a single (state, target) pair
+trainOneStep :: DQNNet -> DQNState -> Double -> Double -> DQNNet
+trainOneStep net state target learningRate =
+  let targetVec = vector [target]
+  in trainStepMSE learningRate net state targetVec
+
+-- | Compute MSE loss for a single (state, target) pair
+computeLoss :: DQNNet -> DQNState -> Double -> Double
+computeLoss net state target =
+  let predicted = evalCritic net state
+      err = predicted - target
+  in err * err
+
+-- | Create a sample state for testing
+sampleState :: DQNState
+sampleState = vector [0.1, 0.2, -0.1, 0.3]
+
+-- | Create another sample state
+sampleState2 :: DQNState
+sampleState2 = vector [-0.2, 0.4, 0.1, -0.3]
+
+-- | Demo function showing how to use the utilities
+demoUtilities :: IO ()
+demoUtilities = do
+  putStrLn "=== DQN Utilities Demo ==="
+  
+  -- Get a random network
+  net <- getRandomNet
+  putStrLn $ "Initial network created"
+  
+  -- Evaluate critic on sample state
+  let initialOutput = evalCritic net sampleState
+  putStrLn $ "Initial critic output: " ++ show initialOutput
+  
+  -- Compute loss with target = 5.0
+  let target = 5.0
+  let initialLoss = computeLoss net sampleState target
+  putStrLn $ "Initial loss (target=" ++ show target ++ "): " ++ show initialLoss
+  
+  -- Train for one step
+  let learningRate = 0.01
+  let trainedNet = trainOneStep net sampleState target learningRate
+  
+  -- Check new output and loss
+  let newOutput = evalCritic trainedNet sampleState
+  let newLoss = computeLoss trainedNet sampleState target
+  
+  putStrLn $ "After training - critic output: " ++ show newOutput
+  putStrLn $ "After training - loss: " ++ show newLoss
+  putStrLn $ "Loss improvement: " ++ show (initialLoss - newLoss)
+  
+  -- Test on a different state
+  let otherOutput = evalCritic trainedNet sampleState2
+  putStrLn $ "Output on different state: " ++ show otherOutput
+
+-- | Train network on multiple steps and show loss trajectory
+trainMultipleSteps :: DQNNet -> DQNState -> Double -> Double -> Int -> IO ()
+trainMultipleSteps net state target learningRate steps = do
+  putStrLn $ "=== Training for " ++ show steps ++ " steps ==="
+  putStrLn $ "State: " ++ show (extract state)
+  putStrLn $ "Target: " ++ show target
+  putStrLn $ "Learning rate: " ++ show learningRate
+  putStrLn ""
+  
+  let trainAndPrint n step = do
+        let output = evalCritic n state
+        let loss = computeLoss n state target
+        putStrLn $ "Step " ++ show step ++ ": output=" ++ show output ++ ", loss=" ++ show loss
+        return $ trainOneStep n state target learningRate
+  
+  -- Initial state
+  let initialOutput = evalCritic net state
+  let initialLoss = computeLoss net state target
+  putStrLn $ "Step 0: output=" ++ show initialOutput ++ ", loss=" ++ show initialLoss
+  
+  -- Train step by step
+  finalNet <- foldM trainAndPrint net [1..steps]
+  
+  let finalOutput = evalCritic finalNet state
+  let finalLoss = computeLoss finalNet state target
+  putStrLn ""
+  putStrLn $ "Final: output=" ++ show finalOutput ++ ", loss=" ++ show finalLoss
+  putStrLn $ "Total loss improvement: " ++ show (initialLoss - finalLoss)
+
+-- | Quick test function for different targets
+testDifferentTargets :: IO ()
+testDifferentTargets = do
+  net <- getRandomNet
+  let targets = [0.0, 1.0, 5.0, 10.0, -2.0]
+  putStrLn "=== Testing different targets ==="
+  putStrLn $ "State: " ++ show (extract sampleState)
+  putStrLn ""
+  
+  mapM_ (\target -> do
+          let output = evalCritic net sampleState
+          let loss = computeLoss net sampleState target
+          putStrLn $ "Target " ++ show target ++ ": output=" ++ show output ++ ", loss=" ++ show loss
+        ) targets
+
 main :: IO ()
-main = MWC.withSystemRandom $ \g -> do
-  putStrLn "Initializing neural network..."
-  net0 <- MWC.uniformR @(Network 4 64 64 1) (-0.5, 0.5) g
-  env <- Gym.Environment.makeEnv "CartPole-v1"
-  case env of
-    Left err -> do
-      putStrLn $ "Environment error: " ++ show err
-      return ()
-    Right envHandle -> do
-      initialState <- Gym.Environment.reset envHandle
-      case initialState of
-        Left err -> do
-          putStrLn $ "Reset error: " ++ show err
-          return ()
-        Right obs -> do
-          case parseObservation obs of
-            Nothing -> do
-              putStrLn $ "Parsing returned nothing"
-              return ()
-            Just state -> do
-              let stateVec = vectorFromList state
-              -- Sample initial trajectory to show before training
-              trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
-              
-              -- putStrLn "\n=== INITIAL TRAJECTORY (BEFORE TRAINING) ==="
-              -- putStrLn $ showTrajectory trajectory
-              
-              -- putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
-              -- putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
-              
-              -- putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
-              -- putStrLn $ showQValueComparison net0 0.99 trajectory
-              
-              -- Train network for 100 epochs with reduced learning rate
-              putStrLn "\n=== TRAINING FOR 100 EPOCHS ==="
-              trainedNet <- trainForEpochs net0 0.001 0.99 100 envHandle
-              putStrLn "Training completed!"
-              
-              -- Sample trajectory with trained network
-              finalTrajectory <- trajectoryFromEnv envHandle trainedNet
-              
-              -- putStrLn "\n=== FINAL TRAJECTORY (AFTER TRAINING) ==="
-              -- putStrLn $ showTrajectory finalTrajectory
-              
-              putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
-              putStrLn $ showQValueComparison trainedNet 0.99 finalTrajectory
-              
-              -- Show MSE loss improvement on original trajectory
-              let originalMSELoss = averageMSELoss net0 0.99 trajectory
-              let trainedMSELoss = averageMSELoss trainedNet 0.99 trajectory
-              putStrLn $ "\nOriginal MSE loss: " ++ show originalMSELoss
-              putStrLn $ "Trained MSE loss: " ++ show trainedMSELoss
-              putStrLn $ "Loss improvement: " ++ show (originalMSELoss - trainedMSELoss)
-              
-              closeEnv envHandle
-              return ()
+main = do
+  -- First run the utilities demo
+  demoUtilities
+  
+  -- Then run the full training
+  MWC.withSystemRandom $ \g -> do
+    putStrLn "Initializing neural network..."
+    net0 <- MWC.uniformR @(Network 4 64 64 1) (-0.5, 0.5) g
+    env <- Gym.Environment.makeEnv "CartPole-v1"
+    case env of
+      Left err -> do
+        putStrLn $ "Environment error: " ++ show err
+        return ()
+      Right envHandle -> do
+        initialState <- Gym.Environment.reset envHandle
+        case initialState of
+          Left err -> do
+            putStrLn $ "Reset error: " ++ show err
+            return ()
+          Right obs -> do
+            case parseObservation obs of
+              Nothing -> do
+                putStrLn $ "Parsing returned nothing"
+                return ()
+              Just state -> do
+                let stateVec = vectorFromList state
+                -- Sample initial trajectory to show before training
+                trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
+                
+                -- putStrLn "\n=== INITIAL TRAJECTORY (BEFORE TRAINING) ==="
+                -- putStrLn $ showTrajectory trajectory
+                
+                -- putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
+                -- putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
+                
+                -- putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
+                -- putStrLn $ showQValueComparison net0 0.99 trajectory
+                
+                -- Train network for 100 epochs with reduced learning rate
+                putStrLn "\n=== TRAINING FOR 100 EPOCHS ==="
+                trainedNet <- trainForEpochs net0 0.001 0.99 100 envHandle
+                putStrLn "Training completed!"
+                
+                -- Sample trajectory with trained network
+                finalTrajectory <- trajectoryFromEnv envHandle trainedNet
+                
+                -- putStrLn "\n=== FINAL TRAJECTORY (AFTER TRAINING) ==="
+                -- putStrLn $ showTrajectory finalTrajectory
+                
+                putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
+                putStrLn $ showQValueComparison trainedNet 0.99 finalTrajectory
+                
+                -- Show MSE loss improvement on original trajectory
+                let originalMSELoss = averageMSELoss net0 0.99 trajectory
+                let trainedMSELoss = averageMSELoss trainedNet 0.99 trajectory
+                putStrLn $ "\nOriginal MSE loss: " ++ show originalMSELoss
+                putStrLn $ "Trained MSE loss: " ++ show trainedMSELoss
+                putStrLn $ "Loss improvement: " ++ show (originalMSELoss - trainedMSELoss)
+                
+                closeEnv envHandle
+                return ()
         
