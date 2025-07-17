@@ -214,10 +214,10 @@ main = MWC.withSystemRandom $ \g -> do
               return ()
             Just state -> do
               let stateVec = vectorFromList state
-              -- Sample trajectory and train network
+              -- Sample initial trajectory to show before training
               trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
               
-              putStrLn "\n=== ORIGINAL TRAJECTORY ==="
+              putStrLn "\n=== INITIAL TRAJECTORY (BEFORE TRAINING) ==="
               putStrLn $ showTrajectory trajectory
               
               putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
@@ -226,14 +226,21 @@ main = MWC.withSystemRandom $ \g -> do
               putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
               putStrLn $ showQValueComparison net0 0.99 trajectory
               
-              -- Train network on trajectory
-              let trainedNet = trainOnTrajectory net0 0.01 0.99 trajectory
-              putStrLn "\n=== TRAINING COMPLETED ==="
+              -- Train network for 100 epochs
+              putStrLn "\n=== TRAINING FOR 100 EPOCHS ==="
+              trainedNet <- trainForEpochs net0 0.01 0.99 10 envHandle
+              putStrLn "Training completed!"
+              
+              -- Sample trajectory with trained network
+              finalTrajectory <- trajectoryFromEnv envHandle trainedNet
+              
+              putStrLn "\n=== FINAL TRAJECTORY (AFTER TRAINING) ==="
+              putStrLn $ showTrajectory finalTrajectory
               
               putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
-              putStrLn $ showQValueComparison trainedNet 0.99 trajectory
+              putStrLn $ showQValueComparison trainedNet 0.99 finalTrajectory
               
-              -- Show loss improvement
+              -- Show loss improvement on original trajectory
               let originalLoss = averageLoss (calculateQTargets net0 0.99 trajectory) net0
               let trainedLoss = averageLoss (calculateQTargets trainedNet 0.99 trajectory) trainedNet
               putStrLn $ "\nOriginal loss: " ++ show originalLoss
