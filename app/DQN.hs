@@ -190,12 +190,6 @@ showQValueComparison net gamma trajectory =
          "Target Q=" ++ show target ++ ", " ++
          "MSE Loss=" ++ show mseErr
 
--- Check if network output has NaN values
-hasNaN :: DQNNet -> Bool
-hasNaN net = 
-  let testOutput = runNetForQ net (vector [0.0, 0.0, 0.0, 0.0])
-  in any isNaN (LA.toList $ extract testOutput)
-
 
 -- ReLU activation function for backpropagation
 reluBackpropVec :: (KnownNat n, Reifies s W) => BVar s (R n) -> BVar s (R n)
@@ -234,15 +228,21 @@ trainStepMSE learningRate net input target =
       debugInfo = "Predicted: " ++ (show predicted) ++ " Actual: " ++ (show target) ++ " Error: " ++ (show $ err)
   in retVal --trace debugInfo retVal
 
+-- trainStepActorMSE :: Double -> DQNNet -> DQNState -> R 2 -> DQNNet
+-- trainStepActorMSE learningRate net input target = 
+--   let predicted = evalBP (\netVar -> runNetForActor netVar input) net
+--       err = evalBP (\netVar -> mseErr input target netVar) net
+--       retVal = net - realToFrac learningRate * gradBP (mseErr input target) net
+--       debugInfo = "Predicted: " ++ (show predicted) ++ " Actual: " ++ (show target) ++ " Error: " ++ (show $ err)
+--   in retVal --trace debugInfo retVal
+
 -- Train network on trajectory with MSE loss
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
 trainOnTrajectory net learningRate gamma trajectory = 
   let trainingPairs = calculateQTargets net gamma trajectory
       -- Use MSE loss for Q-value regression
       newNet = foldl (\n (state, target) -> trainStepMSE learningRate n state target) net trainingPairs
-  in if hasNaN newNet
-     then net  -- Return original network if NaN detected
-     else newNet
+  in newNet
 
 trajectoryFromEnv :: Environment -> DQNNet -> IO (Trajectory)
 trajectoryFromEnv envHandle net = do
@@ -266,23 +266,17 @@ trainForEpochs net learningRate gamma epochs envHandle = do
   trajectory <- trajectoryFromEnv envHandle net
   let newNet = trainOnTrajectory net learningRate gamma trajectory
   
-  -- Check for NaN and report progress
-  if hasNaN newNet
+  -- Report progress every 10 epochs
+  if (101 - epochs) `mod` 10 == 0
     then do
-      putStrLn $ "Warning: NaN detected at epoch " ++ show (101 - epochs) ++ ", stopping training"
-      return net
-    else do
-      -- Report progress every 10 epochs
-      if (101 - epochs) `mod` 10 == 0
-        then do
-          let sampleQ = runNetForQ newNet (vector [0.0, 0.0, 0.0, 0.0])
-          let mseLoss = averageMSELoss newNet gamma trajectory
-          putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
-                     ", Sample Q-value: " ++ show (extract sampleQ) ++
-                     ", MSE Loss: " ++ show mseLoss
-        else return ()
-      
-      trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
+      let sampleQ = runNetForQ newNet (vector [0.0, 0.0, 0.0, 0.0])
+      let mseLoss = averageMSELoss newNet gamma trajectory
+      putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
+                  ", Sample Q-value: " ++ show (extract sampleQ) ++
+                  ", MSE Loss: " ++ show mseLoss
+    else return ()
+  
+  trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
 
 -- ============================================================================
 -- GLOROT INITIALIZATION
@@ -333,10 +327,16 @@ evalCritic net state =
   in (extract output) LA.! 0
 
 -- | Train network for one step on a single (state, target) pair
-trainOneStep :: DQNNet -> DQNState -> Double -> Double -> DQNNet
-trainOneStep net state target learningRate =
-  let targetVec = vector [target]
-  in trainStepMSE learningRate net state targetVec
+-- trainOneStep :: DQNNet -> DQNState -> Double -> Double -> DQNNet
+-- trainOneStep net state target learningRate =
+--   let targetVec = vector [target]
+--   in trainStepMSE learningRate net state targetVec
+
+-- trainActorOneStep :: DQNActor -> DQNState -> Double -> Double -> Int -> DQNActor
+-- trainActorOneStep net state target learningRate action =
+--   let output = runNetForActor net state
+--       realTarget = if action == 1 then [(extract output) LA.! 0, target] else [target, (extract output) LA.! 1]
+--   in trainStepActorMSE learningRate net state (LA.fromList realTarget)
 
 -- | Compute MSE loss for a single (state, target) pair
 computeLoss :: DQNNet -> DQNState -> Double -> Double
@@ -373,7 +373,7 @@ demoUtilities = do
   
   -- Train for one step
   let learningRate = 0.01
-  let trainedNet = trainOneStep net sampleState target learningRate
+  let trainedNet = trainStepMSE learningRate net sampleState (vector [target])
   
   -- Check new output and loss
   let newOutput = evalCritic trainedNet sampleState
@@ -400,7 +400,7 @@ trainMultipleSteps net state target learningRate steps = do
         let output = evalCritic n state
         let loss = computeLoss n state target
         putStrLn $ "Step " ++ show step ++ ": output=" ++ show output ++ ", loss=" ++ show loss
-        return $ trainOneStep n state target learningRate
+        return $ trainStepMSE learningRate n state (vector [target]) 
   
   -- Initial state
   let initialOutput = evalCritic net state
