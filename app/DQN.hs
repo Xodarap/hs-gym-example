@@ -108,6 +108,37 @@ parseObservation (Observation (Array arr)) =
     parseNumber _ = Nothing
 parseObservation _ = Nothing
 
+-- Convert action to integer for Q-value indexing
+actionToInt :: Action -> Int
+actionToInt (Action (Number n)) = round $ realToFrac n
+actionToInt _ = 0
+
+-- Calculate Q-value targets from trajectory
+calculateQTargets :: DQNNet -> Double -> Trajectory -> [(DQNState, R 2)]
+calculateQTargets net gamma trajectory = go trajectory
+  where
+    go [] = []
+    go [(state, action, reward)] = [(state, updateQValue (runNetNormal net state) (actionToInt action) reward)] -- Terminal state
+    go ((state, action, reward) : rest@((nextState, _, _) : _)) = 
+      let currentQ = runNetNormal net state
+          nextQ = runNetNormal net nextState
+          actionIdx = actionToInt action
+          maxNextQ = LA.maxElement $ extract nextQ
+          targetQ = reward + gamma * maxNextQ
+          updatedQ = updateQValue currentQ actionIdx targetQ
+      in (state, updatedQ) : go rest
+    
+    updateQValue :: R 2 -> Int -> Double -> R 2
+    updateQValue qvals idx target = 
+      let vals = extract qvals
+          newVals = [if i == idx then target else vals LA.! i | i <- [0,1]]
+      in vector newVals
+
+-- Train network on trajectory
+trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
+trainOnTrajectory net learningRate gamma trajectory = 
+  let trainingPairs = calculateQTargets net gamma trajectory
+  in trainList learningRate trainingPairs net
 -- parseObservation :: Observation -> [Double]
 -- parseObservation (Observation (Array arr)) = (\(Number n) -> toRealFloat n) <$> arr
 -- parseObservation _ = []
@@ -134,8 +165,21 @@ main = MWC.withSystemRandom $ \g -> do
               return ()
             Just state -> do
               let stateVec = vectorFromList state
+              -- Sample trajectory and train network
               trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
-              putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
+              putStrLn "\nTrajectory:"
+              putStrLn $ showTrajectory trajectory
+              
+              -- Train network on trajectory
+              let trainedNet = trainOnTrajectory net0 0.01 0.99 trajectory
+              putStrLn "\nTraining completed. Network updated."
+              
+              -- Show loss improvement
+              let originalLoss = averageLoss (calculateQTargets net0 0.99 trajectory) net0
+              let trainedLoss = averageLoss (calculateQTargets trainedNet 0.99 trajectory) trainedNet
+              putStrLn $ "Original loss: " ++ show originalLoss
+              putStrLn $ "Trained loss: " ++ show trainedLoss
+              
               closeEnv envHandle
               return ()
         
