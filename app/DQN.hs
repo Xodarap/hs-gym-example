@@ -145,29 +145,95 @@ calculateQTargets net gamma trajectory =
           updatedQ = updateQValue currentQ actionIdx discountedReward
       in (state, updatedQ)) discountedTrajectory
 
--- Show predicted vs actual Q-values
+-- Calculate average Huber loss for trajectory
+averageHuberLoss :: DQNNet -> Double -> Double -> Trajectory -> Double
+averageHuberLoss net delta gamma trajectory = 
+  let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
+      losses = map calculateLoss discountedTrajectory
+  in sum losses / fromIntegral (length losses)
+  where
+    calculateLoss (state, action, discountedReward) = 
+      let predictedQ = runNetForQ net state
+          actionIdx = actionToInt action
+          predictedValue = (extract predictedQ) LA.! actionIdx
+          target = discountedReward
+      in huberLoss delta predictedValue target
+
+-- Show predicted vs actual Q-values with Huber loss
 showQValueComparison :: DQNNet -> Double -> Trajectory -> String
 showQValueComparison net gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
       comparisons = zipWith showComparison [(1 :: Int)..] discountedTrajectory
-  in unlines $ "Q-Value Predictions vs Targets:" : comparisons
+      avgHuberLoss = averageHuberLoss net 1.0 gamma trajectory
+  in unlines $ ("Q-Value Predictions vs Targets (Average Huber Loss: " ++ show avgHuberLoss ++ "):") : comparisons
   where
     showComparison stepNum (state, action, discountedReward) = 
       let predictedQ = runNetForQ net state
           actionIdx = actionToInt action
           predictedValue = (extract predictedQ) LA.! actionIdx
           target = discountedReward
+          huberErr = huberLoss 1.0 predictedValue target
       in "Step " ++ show stepNum ++ ": " ++
          "Action=" ++ show actionIdx ++ ", " ++
          "Predicted Q=" ++ show predictedValue ++ ", " ++
          "Target Q=" ++ show target ++ ", " ++
-         "Error=" ++ show (abs (predictedValue - target))
+         "Huber Loss=" ++ show huberErr
 
--- Train network on trajectory
+-- Check if network output has NaN values
+hasNaN :: DQNNet -> Bool
+hasNaN net = 
+  let testOutput = runNetForQ net (vector [0.0, 0.0, 0.0, 0.0])
+  in any isNaN (LA.toList $ extract testOutput)
+
+-- Huber loss function (more robust than MSE)
+huberLoss :: Double -> Double -> Double -> Double
+huberLoss delta predicted target = 
+  let error = abs (predicted - target)
+  in if error <= delta
+     then 0.5 * error * error
+     else delta * (error - 0.5 * delta)
+
+-- Huber loss with backpropagation
+huberLossGrad :: Double -> Double -> Double -> Double
+huberLossGrad delta predicted target = 
+  let error = predicted - target
+      absError = abs error
+  in if absError <= delta
+     then error  -- Gradient is just the error for quadratic part
+     else delta * signum error  -- Gradient is delta * sign(error) for linear part
+
+-- Clamp Q-values to prevent explosion
+clampQValues :: R 2 -> R 2
+clampQValues qvals = 
+  let vals = extract qvals
+      clampedVals = map (\x -> max (-100) (min 100 x)) (LA.toList vals)
+  in vector clampedVals
+
+-- Custom training step using Huber loss
+trainStepHuber :: Double -> Double -> DQNNet -> DQNState -> R 2 -> DQNNet
+trainStepHuber learningRate delta net input target = 
+  let predicted = runNetForQ net input
+      -- Calculate Huber loss gradients for each output
+      predVals = LA.toList $ extract predicted
+      targetVals = LA.toList $ extract target
+      gradients = zipWith (huberLossGrad delta) predVals targetVals
+      gradientVec = vector gradients
+      -- Use the gradient as the "error" for backpropagation
+      -- This approximates the Huber loss gradient
+      errorTarget = predicted - (realToFrac learningRate) * gradientVec
+  in trainStep learningRate input errorTarget net
+
+-- Train network on trajectory with Huber loss and safety checks
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
 trainOnTrajectory net learningRate gamma trajectory = 
   let trainingPairs = calculateQTargets net gamma trajectory
-  in trainList learningRate trainingPairs net
+      -- Clamp target Q-values to prevent explosion
+      clampedPairs = map (\(state, qvals) -> (state, clampQValues qvals)) trainingPairs
+      -- Use Huber loss with delta = 1.0 (common value for DQN)
+      newNet = foldl (\n (state, target) -> trainStepHuber learningRate 1.0 n state target) net clampedPairs
+  in if hasNaN newNet
+     then net  -- Return original network if NaN detected
+     else newNet
 
 trajectoryFromEnv :: Environment -> DQNNet -> IO (Trajectory)
 trajectoryFromEnv envHandle net = do
@@ -190,7 +256,22 @@ trainForEpochs net _ _ 0 _ = return net
 trainForEpochs net learningRate gamma epochs envHandle = do
   trajectory <- trajectoryFromEnv envHandle net
   let newNet = trainOnTrajectory net learningRate gamma trajectory
-  trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
+  
+  -- Check for NaN and report progress
+  if hasNaN newNet
+    then do
+      putStrLn $ "Warning: NaN detected at epoch " ++ show (101 - epochs) ++ ", stopping training"
+      return net
+    else do
+      -- Report progress every 10 epochs
+      if (101 - epochs) `mod` 10 == 0
+        then do
+          let sampleQ = runNetForQ newNet (vector [0.0, 0.0, 0.0, 0.0])
+          putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
+                     ", Sample Q-values: " ++ show (extract sampleQ)
+        else return ()
+      
+      trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
 
 main :: IO ()
 main = MWC.withSystemRandom $ \g -> do
@@ -217,35 +298,35 @@ main = MWC.withSystemRandom $ \g -> do
               -- Sample initial trajectory to show before training
               trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
               
-              putStrLn "\n=== INITIAL TRAJECTORY (BEFORE TRAINING) ==="
-              putStrLn $ showTrajectory trajectory
+              -- putStrLn "\n=== INITIAL TRAJECTORY (BEFORE TRAINING) ==="
+              -- putStrLn $ showTrajectory trajectory
               
-              putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
-              putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
+              -- putStrLn "\n=== DISCOUNTED TRAJECTORY ==="
+              -- putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
               
-              putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
-              putStrLn $ showQValueComparison net0 0.99 trajectory
+              -- putStrLn "\n=== Q-VALUE COMPARISON (BEFORE TRAINING) ==="
+              -- putStrLn $ showQValueComparison net0 0.99 trajectory
               
-              -- Train network for 100 epochs
+              -- Train network for 100 epochs with reduced learning rate
               putStrLn "\n=== TRAINING FOR 100 EPOCHS ==="
-              trainedNet <- trainForEpochs net0 0.01 0.99 10 envHandle
+              trainedNet <- trainForEpochs net0 0.001 0.99 100 envHandle
               putStrLn "Training completed!"
               
               -- Sample trajectory with trained network
               finalTrajectory <- trajectoryFromEnv envHandle trainedNet
               
-              putStrLn "\n=== FINAL TRAJECTORY (AFTER TRAINING) ==="
-              putStrLn $ showTrajectory finalTrajectory
+              -- putStrLn "\n=== FINAL TRAJECTORY (AFTER TRAINING) ==="
+              -- putStrLn $ showTrajectory finalTrajectory
               
               putStrLn "\n=== Q-VALUE COMPARISON (AFTER TRAINING) ==="
               putStrLn $ showQValueComparison trainedNet 0.99 finalTrajectory
               
-              -- Show loss improvement on original trajectory
-              let originalLoss = averageLoss (calculateQTargets net0 0.99 trajectory) net0
-              let trainedLoss = averageLoss (calculateQTargets trainedNet 0.99 trajectory) trainedNet
-              putStrLn $ "\nOriginal loss: " ++ show originalLoss
-              putStrLn $ "Trained loss: " ++ show trainedLoss
-              putStrLn $ "Loss improvement: " ++ show (originalLoss - trainedLoss)
+              -- Show Huber loss improvement on original trajectory
+              let originalHuberLoss = averageHuberLoss net0 1.0 0.99 trajectory
+              let trainedHuberLoss = averageHuberLoss trainedNet 1.0 0.99 trajectory
+              putStrLn $ "\nOriginal Huber loss: " ++ show originalHuberLoss
+              putStrLn $ "Trained Huber loss: " ++ show trainedHuberLoss
+              putStrLn $ "Loss improvement: " ++ show (originalHuberLoss - trainedHuberLoss)
               
               closeEnv envHandle
               return ()
