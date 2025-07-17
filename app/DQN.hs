@@ -13,15 +13,20 @@
 
 module DQN where
 
-import           NeuralNetwork
+import NeuralNetwork
 import Control.Monad (replicateM, when)
 import Data.List (maximumBy)
 import Data.Ord (comparing)
 import System.Random
-import GHC.Generics
+-- import GHC.Generics
 import Gym.Environment
 import Gym.Core
 import qualified System.Random.MWC as MWC
+import           Numeric.LinearAlgebra.Static
+import qualified Numeric.LinearAlgebra               as HM
+import Data.Aeson (Value(Number, Array))
+import qualified Data.Vector as V
+import qualified Numeric.LinearAlgebra as LA
 
 -- DQN Network Architecture
 data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int }
@@ -36,6 +41,9 @@ type Reward = Double
 -- Gym.Environment.step 
 -- :: Environment -> Action -> IO (Either GymError StepResult)
 
+argmax :: R 2 -> Int
+argmax v = if v HM.! 0 > v HM.! 1 then 0 else 1
+
 getAction :: DQNNet -> DQNState -> IO Action
 getAction net input = do
   let output = runNetNormal net input
@@ -44,47 +52,68 @@ getAction net input = do
     then (Action . Number) <$> randomRIO (0, 1)
     else return $ Action $ Number $ fromIntegral $ argmax output
 
-transition :: Environment -> Action -> IO (DQNState, Reward, Bool)
-transition env action = do
+makeTransition :: Environment -> Action -> IO (DQNState, Reward, Bool)
+makeTransition env action = do
     stepResult <- Gym.Environment.step env action
     case stepResult of
       Left err -> do
         putStrLn $ "Step error: " ++ show err
         return (vector [0.0, 0.0, 0.0, 0.0], 0.0, True)
       Right result -> do
-        return (stepState result, stepReward result, stepTerminated result || stepTruncated result)
+        case parseObservation $ stepObservation result of
+          Nothing -> ([], stepReward result, ((stepTerminated result) || (stepTruncated result)))
+          Just state -> (state, stepReward result, (stepTerminated result || stepTruncated result))
 
-sampleTrajectory :: DQNNet -> DQNState -> IO (DQNState -> (Reward, DQNState)) -> [(DQNState, DQNOutput, Reward)]
-sampleTrajectory net input = do
+sampleTrajectory :: DQNNet -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO [(DQNState, DQNOutput, Reward)]
+sampleTrajectory net input transition = do
   let output = runNetNormal net input
   action <- getAction net input
-  (nextState, reward, done) <- transition input action
+  (nextState, reward, done) <- transition action
   if done
     then return [(input, output, reward)]
     else do
       nextTrajectory <- sampleTrajectory net nextState transition
       return ((input, output, reward) : nextTrajectory)
 
+parseObservation :: Observation -> Maybe (LA.Vector Double)
+parseObservation (Observation (Array arr)) = 
+  let values = V.toList arr
+      doubles = mapM parseNumber values
+  in fmap (fromList . V.toList . V.fromList) doubles
+  where
+    parseNumber (Number n) = Just (realToFrac n)
+    parseNumber _ = Nothing
+parseObservation _ = Nothing
+
+-- parseObservation :: Observation -> [Double]
+-- parseObservation (Observation (Array arr)) = (\(Number n) -> toRealFloat n) <$> arr
+-- parseObservation _ = []
+
 main :: IO ()
 main = MWC.withSystemRandom $ \g -> do
   putStrLn "Initializing neural network..."
   net0 <- MWC.uniformR @(Network 4 64 64 2) (-0.5, 0.5) g
   env <- Gym.Environment.makeEnv "CartPole-v1"
-  initialState <- Gym.Environment.reset env
-  case initialState of
+  case env of
     Left err -> do
-      putStrLn $ "Reset error: " ++ show err
+      putStrLn $ "Environment error: " ++ show err
       return ()
-    Right (Observation obs) -> do
-      case parseObservation obs of
-        Nothing -> do
-          putStrLn "Failed to parse initial observation"
+    Right env -> do
+      initialState <- Gym.Environment.reset env
+      case initialState of
+        Left err -> do
+          putStrLn $ "Reset error: " ++ show err
           return ()
-        Just state -> do
-          trajectory <- sampleTrajectory net state (transition env)
-          putStrLn $ "Trajectory: " ++ show trajectory
-          return ()
-  
+        Right obs -> do
+          case parseObservation obs of
+            Nothing -> do
+              putStrLn $ "Parsing returned nothing"
+              return ()
+            Just state -> do
+              trajectory <- sampleTrajectory net0 state (makeTransition env)
+              putStrLn $ "Trajectory: " ++ show trajectory
+              return ()
+        
 
 -- loss :: DQNNet -> DQNInput -> DQNOutput -> Double
 -- loss net input target = sum (zipWith (\a b -> (a - b) ^ 2) (extract output) (extract target)) / fromIntegral (length output)

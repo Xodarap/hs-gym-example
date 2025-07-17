@@ -74,7 +74,8 @@ executable gym-test
                       vector >=0.11,
                       random >=1.0,
                       containers >=0.5,
-                      backprop >=0.2.7
+                      backprop >=0.2.7,
+                      bytestring
 
     -- Directories containing source files.
     hs-source-dirs:   app
@@ -196,7 +197,9 @@ executable dqn
                       transformers,
                       split,
                       one-liner,
+                      aeson >=2.0,
                       one-liner-instances >= 0.1.2 && < 0.1.3
+
 
     -- Directories containing source files.
     hs-source-dirs:   app, lib
