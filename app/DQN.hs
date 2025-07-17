@@ -86,7 +86,22 @@ sampleTrajectory net input transition = do
       return ((input, output, reward) : nextTrajectory)
 
 makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
-makeDiscountedTrajectory gamma trajectory = DT $ reverse $ snd $ foldl (\(d, l) (i, o, r) -> (d * gamma, (i, o, d * r) : l)) (1,[]) trajectory
+makeDiscountedTrajectory gamma trajectory = 
+  let inner ((ti, to, tr):u:us) = let r@((ui, uo, ur):rs) = inner (u:us) in (ti, to, gamma * ur + tr) : r
+      inner (x:xs) = [x]
+      inner [] = []
+  in DT $ inner trajectory
+
+showDiscountedTrajectory :: DiscountedTrajectory -> String
+showDiscountedTrajectory (DT t) = showTrajectory t
+showTrajectory :: Trajectory -> String
+showTrajectory trajectory = unlines $ zipWith showStep [1..] trajectory
+  where
+    showStep stepNum (state, output, reward) = 
+      "Step " ++ show stepNum ++ ": " ++
+      "State=" ++ show (extract state) ++ ", " ++
+      "Q-values=" ++ show (extract output) ++ ", " ++
+      "Reward=" ++ show reward
 
 parseObservation :: Observation -> Maybe [Double]
 parseObservation (Observation (Array arr)) = 
@@ -125,7 +140,7 @@ main = MWC.withSystemRandom $ \g -> do
             Just state -> do
               let stateVec = vectorFromList state
               trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
-              putStrLn $ "Trajectory: " ++ show trajectory
+              putStrLn $ showDiscountedTrajectory (makeDiscountedTrajectory 0.99 trajectory)
               return ()
         
 
