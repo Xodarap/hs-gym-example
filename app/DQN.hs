@@ -11,7 +11,7 @@
 {-# LANGUAGE ViewPatterns                #-}
 {-# OPTIONS_GHC -Wno-orphans             #-}
 
-module DQN where
+module Main where
 
 import NeuralNetwork
 import Control.Monad (replicateM, when)
@@ -42,14 +42,22 @@ type Reward = Double
 -- :: Environment -> Action -> IO (Either GymError StepResult)
 
 argmax :: R 2 -> Int
-argmax v = if v HM.! 0 > v HM.! 1 then 0 else 1
+argmax v = 
+  let vals = extract v
+  in if vals LA.! 0 > vals LA.! 1 then 0 else 1
+
+vectorFromList :: [Double] -> R 4
+vectorFromList [a, b, c, d] = vector [a, b, c, d]
+vectorFromList _ = vector [0.0, 0.0, 0.0, 0.0]
 
 getAction :: DQNNet -> DQNState -> IO Action
 getAction net input = do
   let output = runNetNormal net input
-  doRandom <- randomRIO (0.0, 1.0)
+  doRandom <- randomRIO (0.0, 1.0 :: Double)
   if doRandom < 0.1
-    then (Action . Number) <$> randomRIO (0, 1)
+    then do
+      randomAction <- randomRIO (0, 1 :: Int)
+      return $ Action $ Number $ fromIntegral randomAction
     else return $ Action $ Number $ fromIntegral $ argmax output
 
 makeTransition :: Environment -> Action -> IO (DQNState, Reward, Bool)
@@ -61,8 +69,8 @@ makeTransition env action = do
         return (vector [0.0, 0.0, 0.0, 0.0], 0.0, True)
       Right result -> do
         case parseObservation $ stepObservation result of
-          Nothing -> ([], stepReward result, ((stepTerminated result) || (stepTruncated result)))
-          Just state -> (state, stepReward result, (stepTerminated result || stepTruncated result))
+          Nothing -> return (vector [0.0, 0.0, 0.0, 0.0], stepReward result, stepTerminated result || stepTruncated result)
+          Just state -> return (vectorFromList state, stepReward result, stepTerminated result || stepTruncated result)
 
 sampleTrajectory :: DQNNet -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO [(DQNState, DQNOutput, Reward)]
 sampleTrajectory net input transition = do
@@ -75,11 +83,11 @@ sampleTrajectory net input transition = do
       nextTrajectory <- sampleTrajectory net nextState transition
       return ((input, output, reward) : nextTrajectory)
 
-parseObservation :: Observation -> Maybe (LA.Vector Double)
+parseObservation :: Observation -> Maybe [Double]
 parseObservation (Observation (Array arr)) = 
   let values = V.toList arr
       doubles = mapM parseNumber values
-  in fmap (fromList . V.toList . V.fromList) doubles
+  in doubles
   where
     parseNumber (Number n) = Just (realToFrac n)
     parseNumber _ = Nothing
@@ -98,8 +106,8 @@ main = MWC.withSystemRandom $ \g -> do
     Left err -> do
       putStrLn $ "Environment error: " ++ show err
       return ()
-    Right env -> do
-      initialState <- Gym.Environment.reset env
+    Right envHandle -> do
+      initialState <- Gym.Environment.reset envHandle
       case initialState of
         Left err -> do
           putStrLn $ "Reset error: " ++ show err
@@ -110,7 +118,8 @@ main = MWC.withSystemRandom $ \g -> do
               putStrLn $ "Parsing returned nothing"
               return ()
             Just state -> do
-              trajectory <- sampleTrajectory net0 state (makeTransition env)
+              let stateVec = vectorFromList state
+              trajectory <- sampleTrajectory net0 stateVec (makeTransition envHandle)
               putStrLn $ "Trajectory: " ++ show trajectory
               return ()
         
