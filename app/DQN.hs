@@ -143,6 +143,17 @@ sampleTrajectoryWithActor net input transition = do
       nextTrajectory <- sampleTrajectoryWithActor net nextState transition
       return ((input, action, reward) : nextTrajectory)
 
+-- Sample trajectory for critic using actor's policy for action selection
+sampleTrajectoryWithActorPolicy :: forall o. KnownNat o => DQNNet o -> DQNActor -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
+sampleTrajectoryWithActorPolicy criticNet actorNet input transition = do
+  action <- getActionFromActor actorNet input  -- Use actor's policy
+  (nextState, reward, done) <- transition action
+  if done
+    then return [(input, action, reward)]
+    else do
+      nextTrajectory <- sampleTrajectoryWithActorPolicy criticNet actorNet nextState transition
+      return ((input, action, reward) : nextTrajectory)
+
 makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
 makeDiscountedTrajectory gamma trajectory = 
   let inner ((ti, to, treward):u:us) = let r@((_, _, ur):_) = inner (u:us) in (ti, to, gamma * ur + treward) : r
@@ -166,6 +177,22 @@ showTrajectory trajectory = unlines $ zipWith showStep [(1 :: Int)..] trajectory
       "State=" ++ show (extract state) ++ ", " ++
       "Action=" ++ show (action) ++ ", " ++
       "Reward=" ++ show reward
+
+-- Calculate trajectory length
+trajectoryLength :: Trajectory -> Int
+trajectoryLength = length
+
+-- Calculate average trajectory length from multiple trajectories
+averageTrajectoryLength :: [Trajectory] -> Double
+averageTrajectoryLength trajectories = 
+  if null trajectories 
+    then 0.0 
+    else fromIntegral (sum (map trajectoryLength trajectories)) / fromIntegral (length trajectories)
+
+-- Sample multiple trajectories for performance evaluation
+sampleMultipleTrajectories :: Int -> Environment -> DQNActor -> IO [Trajectory]
+sampleMultipleTrajectories n envHandle actorNet = do
+  replicateM n (trajectoryFromEnvWithActor envHandle actorNet)
 
 parseObservation :: Observation -> Maybe [Double]
 parseObservation (Observation (Array arr)) = 
@@ -349,6 +376,23 @@ trajectoryFromEnvWithActor envHandle net = do
           let stateVec = vectorFromList state
           sampleTrajectoryWithActor net stateVec (makeTransition envHandle)
 
+-- Trajectory from environment for critic using actor's policy
+trajectoryFromEnvWithActorPolicy :: forall o. KnownNat o => Environment -> DQNNet o -> DQNActor -> IO (Trajectory)
+trajectoryFromEnvWithActorPolicy envHandle criticNet actorNet = do
+  initialState <- Gym.Environment.reset envHandle
+  case initialState of
+    Left err -> do
+      putStrLn $ "Reset error: " ++ show err
+      return []
+    Right obs -> do
+      case parseObservation obs of
+        Nothing -> do
+          putStrLn $ "Parsing returned nothing"
+          return []
+        Just state -> do
+          let stateVec = vectorFromList state
+          sampleTrajectoryWithActorPolicy criticNet actorNet stateVec (makeTransition envHandle)
+
 trainForEpochs :: forall o. KnownNat o => DQNNet o -> Double -> Double -> Int -> Environment -> IO (DQNNet o)
 trainForEpochs net _ _ 0 _ = return net
 trainForEpochs net learningRate gamma epochs envHandle = do
@@ -413,6 +457,57 @@ trainBothNetworks criticNet actorNet learningRate gamma epochs envHandle = do
     else return ()
   
   trainBothNetworks newCriticNet newActorNet learningRate gamma (epochs - 1) envHandle
+
+-- Actor-Critic training function: train actor for 100 epochs, then use it for critic training
+trainActorCritic :: DQNCritic -> DQNActor -> Double -> Double -> Int -> Environment -> IO (DQNCritic, DQNActor)
+trainActorCritic criticNet actorNet _ _ 0 _ = return (criticNet, actorNet)
+trainActorCritic criticNet actorNet learningRate gamma cycles envHandle = do
+  putStrLn $ "\n=== CYCLE " ++ show (cycles) ++ " ==="
+  
+  -- Phase 1: Train actor for 100 epochs
+  putStrLn "Phase 1: Training Actor for 100 epochs..."
+  trainedActor <- trainActorForEpochs actorNet learningRate gamma 100 envHandle
+  
+  -- Evaluate actor performance with multiple trajectories
+  putStrLn "Evaluating Actor performance..."
+  testTrajectories <- sampleMultipleTrajectories 10 envHandle trainedActor
+  let avgLength = averageTrajectoryLength testTrajectories
+  let lengths = map trajectoryLength testTrajectories
+  putStrLn $ "  Average trajectory length: " ++ show (round avgLength) ++ " steps"
+  putStrLn $ "  Trajectory lengths: " ++ show lengths
+  
+  -- Phase 2: Train critic using the trained actor's policy for 100 epochs
+  putStrLn "Phase 2: Training Critic using Actor's policy for 100 epochs..."
+  trainedCritic <- trainCriticWithActorPolicy criticNet trainedActor learningRate gamma 100 envHandle
+  
+  -- Show cycle results
+  let sampleQ = runNetForQ trainedCritic (vector [0.0, 0.0, 0.0, 0.0])
+  let sampleProbs = getActionProbs trainedActor (vector [0.0, 0.0, 0.0, 0.0])
+  putStrLn $ "Cycle " ++ show cycles ++ " completed:"
+  putStrLn $ "  Critic Q-prediction: " ++ show (extract sampleQ)
+  putStrLn $ "  Actor action probs: " ++ show (extract sampleProbs)
+  putStrLn $ "  Performance: " ++ show (round avgLength) ++ " steps average"
+  
+  trainActorCritic trainedCritic trainedActor learningRate gamma (cycles - 1) envHandle
+
+-- Train critic using actor's policy for action selection
+trainCriticWithActorPolicy :: DQNCritic -> DQNActor -> Double -> Double -> Int -> Environment -> IO DQNCritic
+trainCriticWithActorPolicy criticNet _ _ _ 0 _ = return criticNet
+trainCriticWithActorPolicy criticNet actorNet learningRate gamma epochs envHandle = do
+  trajectory <- trajectoryFromEnvWithActorPolicy envHandle criticNet actorNet
+  let newCriticNet = trainOnTrajectory criticNet learningRate gamma trajectory
+  
+  -- Report progress every 25 epochs
+  if epochs `mod` 25 == 0
+    then do
+      let sampleQ = runNetForQ newCriticNet (vector [0.0, 0.0, 0.0, 0.0])
+      let criticLoss = averageMSELoss newCriticNet gamma trajectory
+      putStrLn $ "  Critic Epoch " ++ show (101 - epochs) ++ 
+                  " - Q: " ++ show (extract sampleQ) ++
+                  ", Loss: " ++ show criticLoss
+    else return ()
+  
+  trainCriticWithActorPolicy newCriticNet actorNet learningRate gamma (epochs - 1) envHandle
 
 -- ============================================================================
 -- GLOROT INITIALIZATION
@@ -595,38 +690,73 @@ main = do
               criticTrajectory <- sampleTrajectory criticNet0 stateVec (makeTransition envHandle)
               actorTrajectory <- trajectoryFromEnvWithActor envHandle actorNet0
               
+              -- Evaluate initial actor performance
+              putStrLn "\n=== INITIAL PERFORMANCE (BEFORE TRAINING) ==="
+              initialTestTrajectories <- sampleMultipleTrajectories 10 envHandle actorNet0
+              let initialAvgLength = averageTrajectoryLength initialTestTrajectories
+              let initialLengths = map trajectoryLength initialTestTrajectories
+              putStrLn $ "Initial average trajectory length: " ++ show (round initialAvgLength) ++ " steps"
+              putStrLn $ "Initial trajectory lengths: " ++ show initialLengths
+              
               putStrLn "\n=== INITIAL LOSSES (BEFORE TRAINING) ==="
               let initialCriticLoss = averageMSELoss criticNet0 0.99 criticTrajectory
               let initialActorLoss = averageActorMSELoss actorNet0 0.99 actorTrajectory
               putStrLn $ "Initial Critic MSE Loss: " ++ show initialCriticLoss
               putStrLn $ "Initial Actor MSE Loss: " ++ show initialActorLoss
               
-              -- Train both networks for 100 epochs with reduced learning rate
-              putStrLn "\n=== TRAINING BOTH NETWORKS FOR 100 EPOCHS ==="
-              (trainedCritic, trainedActor) <- trainBothNetworks criticNet0 actorNet0 0.001 0.99 100 envHandle
-              putStrLn "Training completed!"
+              -- Show initial predictions
+              let sampleState = vector [0.0, 0.0, 0.0, 0.0]
+              let initialCriticQ = runNetForQ criticNet0 sampleState
+              let initialActorProbs = getActionProbs actorNet0 sampleState
+              putStrLn $ "Initial Critic Q-value: " ++ show (extract initialCriticQ)
+              putStrLn $ "Initial Actor action probs: " ++ show (extract initialActorProbs)
               
-              -- Sample final trajectories
-              finalCriticTrajectory <- trajectoryFromEnv envHandle trainedCritic
-              finalActorTrajectory <- trajectoryFromEnvWithActor envHandle trainedActor
+              -- Actor-Critic training: 3 cycles of (train actor 100 epochs, then use it for critic 100 epochs)
+              putStrLn "\n=== ACTOR-CRITIC TRAINING (3 CYCLES) ==="
+              putStrLn "Each cycle: Train Actor (100 epochs) → Train Critic using Actor's policy (100 epochs)"
+              (finalCritic, finalActor) <- trainActorCritic criticNet0 actorNet0 0.001 0.99 3 envHandle
+              putStrLn "\nActor-Critic training completed!"
               
-              putStrLn "\n=== FINAL COMPARISON (AFTER TRAINING) ==="
-              let finalCriticLoss = averageMSELoss trainedCritic 0.99 finalCriticTrajectory
-              let finalActorLoss = averageActorMSELoss trainedActor 0.99 finalActorTrajectory
+              -- Evaluate final actor performance
+              putStrLn "\n=== FINAL PERFORMANCE (AFTER ACTOR-CRITIC TRAINING) ==="
+              finalTestTrajectories <- sampleMultipleTrajectories 10 envHandle finalActor
+              let finalAvgLength = averageTrajectoryLength finalTestTrajectories
+              let finalLengths = map trajectoryLength finalTestTrajectories
+              putStrLn $ "Final average trajectory length: " ++ show (round finalAvgLength) ++ " steps"
+              putStrLn $ "Final trajectory lengths: " ++ show finalLengths
+              
+              -- Sample final trajectories using the trained networks
+              finalCriticTrajectory <- trajectoryFromEnvWithActorPolicy envHandle finalCritic finalActor
+              finalActorTrajectory <- trajectoryFromEnvWithActor envHandle finalActor
+              
+              putStrLn "\n=== FINAL COMPARISON (AFTER ACTOR-CRITIC TRAINING) ==="
+              let finalCriticLoss = averageMSELoss finalCritic 0.99 finalCriticTrajectory
+              let finalActorLoss = averageActorMSELoss finalActor 0.99 finalActorTrajectory
               let criticImprovement = initialCriticLoss - finalCriticLoss
               let actorImprovement = initialActorLoss - finalActorLoss
+              let performanceImprovement = finalAvgLength - initialAvgLength
               
               putStrLn $ "Final Critic MSE Loss: " ++ show finalCriticLoss
               putStrLn $ "Critic Loss Improvement: " ++ show criticImprovement
               putStrLn $ "Final Actor MSE Loss: " ++ show finalActorLoss
               putStrLn $ "Actor Loss Improvement: " ++ show actorImprovement
+              putStrLn $ "Performance improvement: " ++ show (round performanceImprovement) ++ " steps"
               
-              -- Show sample predictions
-              let sampleState = vector [0.0, 0.0, 0.0, 0.0]
-              let finalCriticQ = runNetForQ trainedCritic sampleState
-              let finalActorProbs = getActionProbs trainedActor sampleState
+              -- Show final predictions
+              let finalCriticQ = runNetForQ finalCritic sampleState
+              let finalActorProbs = getActionProbs finalActor sampleState
               putStrLn $ "\nFinal Critic Q-value prediction: " ++ show (extract finalCriticQ)
               putStrLn $ "Final Actor action probabilities: " ++ show (extract finalActorProbs)
+              
+              -- Show improvement percentages
+              let criticImprovementPct = if initialCriticLoss /= 0 then (criticImprovement / initialCriticLoss) * 100 else 0
+              let actorImprovementPct = if initialActorLoss /= 0 then (actorImprovement / initialActorLoss) * 100 else 0
+              let performanceImprovementPct = if initialAvgLength /= 0 then (performanceImprovement / initialAvgLength) * 100 else 0
+              putStrLn $ "\nImprovement Summary:"
+              putStrLn $ "Critic: " ++ show (round criticImprovementPct) ++ "% improvement"
+              putStrLn $ "Actor: " ++ show (round actorImprovementPct) ++ "% improvement"
+              putStrLn $ "Performance: " ++ show (round performanceImprovementPct) ++ "% improvement (" ++ 
+                         show (round initialAvgLength) ++ " → " ++ show (round finalAvgLength) ++ " steps)"
               
               closeEnv envHandle
               return ()
