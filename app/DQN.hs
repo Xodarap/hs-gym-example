@@ -68,16 +68,9 @@ runDQNNetwork net input = runLayerNormal (net ^. nLayer3)
                         . runLayerNormal (net ^. nLayer1)
                         $ input
 
--- Convenient aliases for clarity
-runNetForQ :: forall o. KnownNat o => DQNNet o -> DQNState -> R o
-runNetForQ = runDQNNetwork
-
-runNetForActor :: DQNActor -> DQNState -> R 2
-runNetForActor = runDQNNetwork
-
 -- Get action probabilities from actor using softmax
 getActionProbs :: DQNActor -> DQNState -> R 2
-getActionProbs net input = softmaxVec (runNetForActor net input)
+getActionProbs net input = softmaxVec (runDQNNetwork net input)
 
 -- Sample action from actor probabilities
 sampleActionFromActor :: DQNActor -> DQNState -> IO Action
@@ -98,9 +91,6 @@ getRandomAction = do
   actionInt <- randomAction
   return $ Action $ Number $ fromIntegral actionInt
 
--- Policy-based action selection for actor
-getActionFromActor :: DQNActor -> DQNState -> IO Action
-getActionFromActor = sampleActionFromActor
 
 makeTransition :: Environment -> Action -> IO (DQNState, Reward, Bool)
 makeTransition env action = do
@@ -135,7 +125,7 @@ sampleTrajectoryRandom = sampleTrajectoryWith (const getRandomAction)
 
 -- Trajectory sampling with actor policy
 sampleTrajectoryWithActor :: DQNActor -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
-sampleTrajectoryWithActor net = sampleTrajectoryWith (getActionFromActor net)
+sampleTrajectoryWithActor net = sampleTrajectoryWith (sampleActionFromActor net)
 
 makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
 makeDiscountedTrajectory gamma trajectory = 
@@ -195,7 +185,7 @@ calculateActionQTargets :: DQNActor -> Double -> Trajectory -> [(DQNState, R 2)]
 calculateActionQTargets net gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
   in map (\(state, action, discountedReward) -> 
-      let predicted = runNetForActor net state
+      let predicted = runDQNNetwork net state
           extracted = extract predicted
           target = if (actionToInt action) == 0 
                    then vector [discountedReward, extracted LA.! 1] 
@@ -213,7 +203,7 @@ averageMSELoss net gamma trajectory =
   in sum losses / fromIntegral (length losses)
   where
     calculateLoss (state, _, discountedReward) = 
-      let predictedQ = runNetForQ net state
+      let predictedQ = runDQNNetwork net state
           predictedValue = (extract predictedQ) LA.! 0
           err = predictedValue - discountedReward
       in err * err
@@ -225,7 +215,7 @@ averageActorMSELoss net gamma trajectory =
   in sum losses / fromIntegral (length losses)
   where
     calculateLoss (state, target) = 
-      let predicted = runNetForActor net state
+      let predicted = runDQNNetwork net state
           diff = extract predicted - extract target
           squaredDiff = LA.toList diff
       in sum (map (^2) squaredDiff) / 2.0
@@ -319,7 +309,7 @@ trajectoryFromEnvRandom = trajectoryFromEnvWith (const getRandomAction)
 
 -- Trajectory using actor policy
 trajectoryFromEnvWithActor :: Environment -> DQNActor -> IO Trajectory
-trajectoryFromEnvWithActor envHandle net = trajectoryFromEnvWith (getActionFromActor net) envHandle
+trajectoryFromEnvWithActor envHandle net = trajectoryFromEnvWith (sampleActionFromActor net) envHandle
 
 trainForEpochs :: forall o. KnownNat o => DQNNet o -> Double -> Double -> Int -> Environment -> IO (DQNNet o)
 trainForEpochs net _ _ 0 _ = return net
@@ -330,7 +320,7 @@ trainForEpochs net learningRate gamma epochs envHandle = do
   -- Report progress every 10 epochs
   if (101 - epochs) `mod` 10 == 0
     then do
-      let sampleQ = runNetForQ newNet (vector [0.0, 0.0, 0.0, 0.0])
+      let sampleQ = runDQNNetwork newNet (vector [0.0, 0.0, 0.0, 0.0])
       let mseLoss = averageMSELoss newNet gamma trajectory
       putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
                   ", Sample Q-value: " ++ show (extract sampleQ) ++
@@ -373,7 +363,7 @@ trainBothNetworks criticNet actorNet learningRate gamma epochs envHandle = do
   -- Report progress every 10 epochs
   if (epochs `mod` 10 == 0) || (epochs <= 10)
     then do
-      let sampleQ = runNetForQ newCriticNet (vector [0.0, 0.0, 0.0, 0.0])
+      let sampleQ = runDQNNetwork newCriticNet (vector [0.0, 0.0, 0.0, 0.0])
       let criticLoss = averageMSELoss newCriticNet gamma criticTrajectory
       let sampleProbs = getActionProbs newActorNet (vector [0.0, 0.0, 0.0, 0.0])
       let actorLoss = averageActorMSELoss newActorNet gamma actorTrajectory
@@ -409,7 +399,7 @@ trainActorCritic criticNet actorNet learningRate gamma cycles envHandle = do
   trainedCritic <- trainCriticWithActorPolicy criticNet trainedActor learningRate gamma 100 envHandle
   
   -- Show cycle results
-  let sampleQ = runNetForQ trainedCritic (vector [0.0, 0.0, 0.0, 0.0])
+  let sampleQ = runDQNNetwork trainedCritic (vector [0.0, 0.0, 0.0, 0.0])
   let sampleProbs = getActionProbs trainedActor (vector [0.0, 0.0, 0.0, 0.0])
   putStrLn $ "Cycle " ++ show cycles ++ " completed:"
   putStrLn $ "  Critic Q-prediction: " ++ show (extract sampleQ)
@@ -428,7 +418,7 @@ trainCriticWithActorPolicy criticNet actorNet learningRate gamma epochs envHandl
   -- Report progress every 25 epochs
   if epochs `mod` 25 == 0
     then do
-      let sampleQ = runNetForQ newCriticNet (vector [0.0, 0.0, 0.0, 0.0])
+      let sampleQ = runDQNNetwork newCriticNet (vector [0.0, 0.0, 0.0, 0.0])
       let criticLoss = averageMSELoss newCriticNet gamma trajectory
       putStrLn $ "  Critic Epoch " ++ show (101 - epochs) ++ 
                   " - Q: " ++ show (extract sampleQ) ++
@@ -515,7 +505,7 @@ main = do
               
               -- Show initial predictions
               let sampleState = vector [0.0, 0.0, 0.0, 0.0]
-              let initialCriticQ = runNetForQ criticNet0 sampleState
+              let initialCriticQ = runDQNNetwork criticNet0 sampleState
               let initialActorProbs = getActionProbs actorNet0 sampleState
               putStrLn $ "Initial Critic Q-value: " ++ show (extract initialCriticQ)
               putStrLn $ "Initial Actor action probs: " ++ show (extract initialActorProbs)
@@ -552,7 +542,7 @@ main = do
               putStrLn $ "Performance improvement: " ++ show (round performanceImprovement) ++ " steps"
               
               -- Show final predictions
-              let finalCriticQ = runNetForQ finalCritic sampleState
+              let finalCriticQ = runDQNNetwork finalCritic sampleState
               let finalActorProbs = getActionProbs finalActor sampleState
               putStrLn $ "\nFinal Critic Q-value prediction: " ++ show (extract finalCriticQ)
               putStrLn $ "Final Actor action probabilities: " ++ show (extract finalActorProbs)
