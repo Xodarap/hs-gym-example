@@ -37,8 +37,9 @@ data DQNSpec = DQNSpec { inputSize :: Int, hiddenSize :: Int, outputSize :: Int 
   deriving (Show, Eq)
 
 
-type DQNNet = Network 4 64 64 1
-type DQNActor = Network 4 64 64 2
+type DQNNet o = Network 4 64 64 o
+type DQNCritic = DQNNet 1
+type DQNActor = DQNNet 2
 type DQNState = R 4
 type DQNOutput = R 1
 type Reward = Double
@@ -61,7 +62,7 @@ reluVec :: (KnownNat n) => R n -> R n
 reluVec v = dvmap (\x -> max 0 x) v
 
 -- Run network to get Q-value prediction (no softmax, using ReLU)
-runNetForQ :: DQNNet -> DQNState -> R 1
+runNetForQ :: forall o. KnownNat o => DQNNet o -> DQNState -> R o
 runNetForQ net input = runLayerNormal (net ^. nLayer3)
                      . reluVec
                      . runLayerNormal (net ^. nLayer2)
@@ -77,7 +78,7 @@ runNetForActor net input = runLayerNormal (net ^. nLayer3)
                      . runLayerNormal (net ^. nLayer1)
                      $ input
 
-getAction :: DQNNet -> DQNState -> IO Action
+getAction :: forall o. KnownNat o => DQNNet o -> DQNState -> IO Action
 getAction net input = do
   let output = runNetForQ net input
   -- Always use random action since we're training a critic, not a policy
@@ -96,7 +97,7 @@ makeTransition env action = do
           Nothing -> return (vector [0.0, 0.0, 0.0, 0.0], stepReward result, stepTerminated result || stepTruncated result)
           Just state -> return (vectorFromList state, stepReward result, stepTerminated result || stepTruncated result)
 
-sampleTrajectory :: DQNNet -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
+sampleTrajectory :: forall o. KnownNat o => DQNNet o -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
 sampleTrajectory net input transition = do
   action <- getAction net input
   (nextState, reward, done) <- transition action
@@ -146,7 +147,7 @@ actionToInt (Action (Number n)) = round $ realToFrac n
 actionToInt _ = 0
 
 -- Calculate Q-value targets from discounted trajectory
-calculateQTargets :: Double -> Trajectory -> [(DQNState, R 1)]
+calculateQTargets :: forall o. KnownNat o => Double -> Trajectory -> [(DQNState, R o)]
 calculateQTargets gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
   in map (\(state, action, discountedReward) -> 
@@ -165,7 +166,7 @@ calculateActionQTargets net gamma trajectory =
       in (state, target)) discountedTrajectory
 
 -- Calculate average MSE loss for trajectory
-averageMSELoss :: DQNNet -> Double -> Trajectory -> Double
+averageMSELoss :: forall o. KnownNat o => DQNNet o -> Double -> Trajectory -> Double
 averageMSELoss net gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
       losses = map calculateLoss discountedTrajectory
@@ -179,7 +180,7 @@ averageMSELoss net gamma trajectory =
       in err * err  -- MSE = (predicted - target)^2
 
 -- Show predicted vs actual Q-values with MSE loss
-showQValueComparison :: DQNNet -> Double -> Trajectory -> String
+showQValueComparison :: forall o. KnownNat o =>  DQNNet o -> Double -> Trajectory -> String
 showQValueComparison net gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
       comparisons = zipWith showComparison [(1 :: Int)..] discountedTrajectory
@@ -189,7 +190,7 @@ showQValueComparison net gamma trajectory =
     showComparison stepNum (state, action, discountedReward) = 
       let predictedQ = runNetForQ net state
           actionIdx = actionToInt action
-          predictedValue = (extract predictedQ) LA.! 0  -- Single output
+          predictedValue = (extract predictedQ) LA.! 0  -- Single output -- Todo
           target = discountedReward
           err = predictedValue - target
           mseErr = err * err
@@ -229,7 +230,7 @@ mseErr input target net =
   in 0.5 * (diff <.>! diff)  -- MSE = 0.5 * ||predicted - target||^2
 
 -- MSE-based training step for Q-value regression
-trainStepMSE :: Double -> DQNNet -> DQNState -> R 1 -> DQNNet
+trainStepMSE :: forall o. KnownNat o => Double -> DQNNet o -> DQNState -> R o -> DQNNet o
 trainStepMSE learningRate net input target = 
   let predicted = evalBP (\netVar -> runNetworkForQ netVar input) net
       err = evalBP (\netVar -> mseErr input target netVar) net
@@ -253,7 +254,7 @@ trainStepActorMSE learningRate net input target =
   in retVal --trace debugInfo retVal
 
 -- Train network on trajectory with MSE loss
-trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
+trainOnTrajectory :: forall o. KnownNat o => DQNNet o -> Double -> Double -> Trajectory -> DQNNet o
 trainOnTrajectory net learningRate gamma trajectory = 
   let trainingPairs = calculateQTargets gamma trajectory
       -- Use MSE loss for Q-value regression
@@ -267,7 +268,7 @@ trainOnTrajectory net learningRate gamma trajectory =
 --       newNet = foldl (\n (state, target) -> trainStepActorMSEAct learningRate n state target) net trainingPairs
 --   in newNet
 
-trajectoryFromEnv :: Environment -> DQNNet -> IO (Trajectory)
+trajectoryFromEnv :: forall o. KnownNat o => Environment -> DQNNet o -> IO (Trajectory)
 trajectoryFromEnv envHandle net = do
   initialState <- Gym.Environment.reset envHandle
   case initialState of
@@ -283,7 +284,7 @@ trajectoryFromEnv envHandle net = do
           let stateVec = vectorFromList state
           sampleTrajectory net stateVec (makeTransition envHandle)
 
-trainForEpochs :: DQNNet -> Double -> Double -> Int -> Environment -> IO (DQNNet)
+trainForEpochs :: forall o. KnownNat o => DQNNet o -> Double -> Double -> Int -> Environment -> IO (DQNNet o)
 trainForEpochs net _ _ 0 _ = return net
 trainForEpochs net learningRate gamma epochs envHandle = do
   trajectory <- trajectoryFromEnv envHandle net
@@ -326,11 +327,11 @@ glorotInitLayer = do
   return $ Layer weights biases
 
 -- | Glorot initialization for the entire network
-glorotInitNetwork :: IO DQNNet
+glorotInitNetwork :: forall o. KnownNat o => IO (DQNNet o)
 glorotInitNetwork = do
   layer1 <- glorotInitLayer @4 @64
   layer2 <- glorotInitLayer @64 @64
-  layer3 <- glorotInitLayer @64 @1
+  layer3 <- glorotInitLayer @64 @o
   return $ Net layer1 layer2 layer3
 
 
@@ -340,11 +341,11 @@ glorotInitNetwork = do
 
 -- | Create a random network for testing with Glorot initialization (use this in ghci)
 -- Example: net <- getRandomNet
-getRandomNet :: IO DQNNet
+getRandomNet :: forall o. KnownNat o => IO (DQNNet o)
 getRandomNet = glorotInitNetwork
 
 -- | Evaluate critic on a given state
-evalCritic :: DQNNet -> DQNState -> Double
+evalCritic :: forall o. KnownNat o => (DQNNet o) -> DQNState -> Double
 evalCritic net state = 
   let output = runNetForQ net state
   in (extract output) LA.! 0
@@ -362,7 +363,7 @@ evalCritic net state =
 --   in trainStepActorMSE learningRate net state (LA.fromList realTarget)
 
 -- | Compute MSE loss for a single (state, target) pair
-computeLoss :: DQNNet -> DQNState -> Double -> Double
+computeLoss :: forall o. KnownNat o => DQNNet o -> DQNState -> Double -> Double
 computeLoss net state target =
   let predicted = evalCritic net state
       err = predicted - target
@@ -382,7 +383,7 @@ demoUtilities = do
   putStrLn "=== DQN Utilities Demo ==="
   
   -- Get a random network
-  net <- getRandomNet
+  net <- getRandomNet :: IO (DQNCritic)
   putStrLn $ "Initial network created"
   
   -- Evaluate critic on sample state
@@ -411,7 +412,7 @@ demoUtilities = do
   putStrLn $ "Output on different state: " ++ show otherOutput
 
 -- | Train network on multiple steps and show loss trajectory
-trainMultipleSteps :: DQNNet -> DQNState -> Double -> Double -> Int -> IO ()
+trainMultipleSteps :: forall o. KnownNat o => DQNNet o -> DQNState -> Double -> Double -> Int -> IO ()
 trainMultipleSteps net state target learningRate steps = do
   putStrLn $ "=== Training for " ++ show steps ++ " steps ==="
   putStrLn $ "State: " ++ show (extract state)
@@ -442,7 +443,7 @@ trainMultipleSteps net state target learningRate steps = do
 -- | Quick test function for different targets
 testDifferentTargets :: IO ()
 testDifferentTargets = do
-  net <- getRandomNet
+  net <- getRandomNet :: IO DQNCritic
   let targets = [0.0, 1.0, 5.0, 10.0, -2.0]
   putStrLn "=== Testing different targets ==="
   putStrLn $ "State: " ++ show (extract sampleState)
@@ -457,7 +458,7 @@ testDifferentTargets = do
 main :: IO ()
 main = do  
   putStrLn "Initializing neural network with Glorot initialization..."
-  net0 <- glorotInitNetwork
+  net0 <- glorotInitNetwork :: IO DQNCritic
   env <- Gym.Environment.makeEnv "CartPole-v1"
   case env of
     Left err -> do
