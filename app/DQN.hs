@@ -146,13 +146,22 @@ actionToInt (Action (Number n)) = round $ realToFrac n
 actionToInt _ = 0
 
 -- Calculate Q-value targets from discounted trajectory
-calculateQTargets :: DQNNet -> Double -> Trajectory -> [(DQNState, R 1)]
-calculateQTargets net gamma trajectory = 
+calculateQTargets :: Double -> Trajectory -> [(DQNState, R 1)]
+calculateQTargets gamma trajectory = 
   let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
   in map (\(state, action, discountedReward) -> 
       -- The network now predicts a single Q-value for the action taken
       -- The target is the discounted reward
       let target = vector [discountedReward]
+      in (state, target)) discountedTrajectory
+
+calculateActionQTargets :: DQNActor -> Double -> Trajectory -> [(DQNState, R 2)]
+calculateActionQTargets net gamma trajectory = 
+  let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
+  in map (\(state, action, discountedReward) -> 
+      let predicted = evalBP (\netVar -> runNetworkForQ netVar state) net
+          extracted = extract predicted
+          target = (vector $ if (actionToInt action) == 0 then [discountedReward, extracted LA.! 1] else [extracted LA.! 0, discountedReward]) :: R 2
       in (state, target)) discountedTrajectory
 
 -- Calculate average MSE loss for trajectory
@@ -228,21 +237,35 @@ trainStepMSE learningRate net input target =
       debugInfo = "Predicted: " ++ (show predicted) ++ " Actual: " ++ (show target) ++ " Error: " ++ (show $ err)
   in retVal --trace debugInfo retVal
 
--- trainStepActorMSE :: Double -> DQNNet -> DQNState -> R 2 -> DQNNet
--- trainStepActorMSE learningRate net input target = 
---   let predicted = evalBP (\netVar -> runNetForActor netVar input) net
---       err = evalBP (\netVar -> mseErr input target netVar) net
---       retVal = net - realToFrac learningRate * gradBP (mseErr input target) net
---       debugInfo = "Predicted: " ++ (show predicted) ++ " Actual: " ++ (show target) ++ " Error: " ++ (show $ err)
---   in retVal --trace debugInfo retVal
+trainStepActorMSEAct :: Double -> DQNActor -> DQNState -> Double -> Action -> DQNActor
+trainStepActorMSEAct learningRate net input target action =
+  let predicted = evalBP (\netVar -> runNetworkForQ netVar input) net
+      extracted = extract predicted
+      realTarget = (vector $ if (actionToInt action) == 0 then [target, extracted LA.! 1] else [extracted LA.! 0, target]) :: R 2
+  in trainStepActorMSE learningRate net input realTarget
+
+trainStepActorMSE :: Double -> DQNActor -> DQNState -> R 2 -> DQNActor
+trainStepActorMSE learningRate net input target = 
+  let predicted = evalBP (\netVar -> runNetworkForQ netVar input) net
+      err = evalBP (\netVar -> mseErr input target netVar) net
+      retVal = net - realToFrac learningRate * gradBP (mseErr input target) net
+      debugInfo = "Predicted: " ++ (show predicted) ++ " Actual: " ++ (show target) ++ " Error: " ++ (show $ err)
+  in retVal --trace debugInfo retVal
 
 -- Train network on trajectory with MSE loss
 trainOnTrajectory :: DQNNet -> Double -> Double -> Trajectory -> DQNNet
 trainOnTrajectory net learningRate gamma trajectory = 
-  let trainingPairs = calculateQTargets net gamma trajectory
+  let trainingPairs = calculateQTargets gamma trajectory
       -- Use MSE loss for Q-value regression
       newNet = foldl (\n (state, target) -> trainStepMSE learningRate n state target) net trainingPairs
   in newNet
+
+-- trainActorOnTrajectory :: DQNActor -> Double -> Double -> Trajectory -> DQNNet
+-- trainActorOnTrajectory net learningRate gamma trajectory = 
+--   let trainingPairs = calculateQTargets gamma trajectory
+--       -- Use MSE loss for Q-value regression
+--       newNet = foldl (\n (state, target) -> trainStepActorMSEAct learningRate n state target) net trainingPairs
+--   in newNet
 
 trajectoryFromEnv :: Environment -> DQNNet -> IO (Trajectory)
 trajectoryFromEnv envHandle net = do
