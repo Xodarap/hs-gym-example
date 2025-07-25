@@ -18,7 +18,7 @@ import qualified Numeric.LinearAlgebra as LA
 import Lens.Micro
 import Numeric.Backprop
 import GHC.TypeLits
-import Control.Monad (foldM, replicateM)
+import Control.Monad (replicateM)
 import Data.Proxy
 
 -- ============================================================================
@@ -37,8 +37,8 @@ type ReplayBuffer = [Experience]
 
 -- Add experience to replay buffer with maximum size
 addExperience :: Int -> Experience -> ReplayBuffer -> ReplayBuffer
-addExperience maxSize exp buffer = 
-  let newBuffer = exp : buffer
+addExperience maxSize experience buffer = 
+  let newBuffer = experience : buffer
   in take maxSize newBuffer
 
 -- Sample random batch from replay buffer
@@ -89,14 +89,14 @@ runDQNNetwork net input = runLayerNormal (net ^. nLayer3)
 -- Epsilon-greedy action selection
 selectAction :: DQNNet -> DQNState -> Double -> IO Action
 selectAction net input epsilon = do
-  rand <- randomRIO (0.0, 1.0)
-  if rand < epsilon
+  randNum <- randomRIO (0.0, 1.0)
+  if randNum < epsilon
     then randomAction
     else do
       let qValues = runDQNNetwork net input
       let qList = extract qValues
       let bestAction = if (qList LA.! 0) > (qList LA.! 1) then 0 else 1
-      return $ Action $ Number $ fromIntegral bestAction
+      return $ Action $ Number $ fromIntegral (bestAction :: Int)
 
 -- ============================================================================
 -- ACTION SELECTION
@@ -135,7 +135,7 @@ sampleTrajectoryEpsilonGreedy net epsilon = sampleTrajectoryWith (\state -> sele
 
 makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
 makeDiscountedTrajectory gamma trajectory = 
-  let inner ((ti, to, treward):u:us) = let r@((_, _, ur):_) = inner (u:us) in (ti, to, gamma * ur + treward) : r
+  let inner ((ti, tout, treward):u:us) = let r@((_, _, ur):_) = inner (u:us) in (ti, tout, gamma * ur + treward) : r
       inner [x] = [x]
       inner [] = []
   in DT $ inner trajectory
@@ -156,21 +156,17 @@ parseObservation (Observation (Array arr)) =
 parseObservation _ = Nothing
 
 actionToInt :: Action -> Int
-actionToInt (Action (Number n)) = round $ realToFrac n
+actionToInt (Action (Number n)) = round $ ((realToFrac n) :: Double)
 actionToInt _ = 0
 
 -- ============================================================================
 -- TRAJECTORY ANALYSIS
 -- ============================================================================
-
-trajectoryLength :: Trajectory -> Int
-trajectoryLength = length
-
 averageTrajectoryLength :: [Trajectory] -> Double
 averageTrajectoryLength trajectories = 
   if null trajectories 
     then 0.0 
-    else fromIntegral (sum (map trajectoryLength trajectories)) / fromIntegral (length trajectories)
+    else fromIntegral (sum (map length trajectories)) / fromIntegral (length trajectories)
 
 sampleMultipleTrajectories :: Int -> Environment -> DQNNet -> Double -> IO [Trajectory]
 sampleMultipleTrajectories n envHandle dqnNet epsilon = do
@@ -209,9 +205,9 @@ calculateQTargets qNet targetNet gamma trajectory =
 -- ReLU activation for backpropagation
 reluBackpropVec :: (KnownNat n, Reifies s W) => BVar s (R n) -> BVar s (R n)
 reluBackpropVec = liftOp1 . op1 $ \v -> 
-  let reluVec = dvmap (\x -> max 0 x) v
+  let reluBpVec = dvmap (\x -> max 0 x) v
       grad g = dvmap (\x -> if x > 0 then 1 else 0) v * g
-  in (reluVec, grad)
+  in (reluBpVec, grad)
 
 -- Network execution for backpropagation
 runNetworkForQ :: (Reifies s W) => BVar s DQNNet -> R 4 -> BVar s (R 2)
@@ -313,7 +309,7 @@ trainDQN qNet targetNet learningRate gamma epsilon episodes targetUpdateFreq bat
   trainDQNEpisodes qNet targetNet learningRate gamma epsilon episodes targetUpdateFreq batchSize envHandle buffer 0
 
 trainDQNEpisodes :: DQNNet -> DQNNet -> Double -> Double -> Double -> Int -> Int -> Int -> Environment -> ReplayBuffer -> Int -> IO (DQNNet, DQNNet)
-trainDQNEpisodes qNet targetNet _ _ _ 0 _ _ _ buffer _ = return (qNet, targetNet)
+trainDQNEpisodes qNet targetNet _ _ _ 0 _ _ _ _ _ = return (qNet, targetNet)
 trainDQNEpisodes qNet targetNet learningRate gamma epsilon episodes targetUpdateFreq batchSize envHandle buffer episodeCount = do
   -- Collect experiences
   newBuffer <- generateExperiences qNet epsilon 100 envHandle buffer
@@ -398,8 +394,8 @@ main = do
       -- Test initial performance with low epsilon
       initialTestTrajectories <- sampleMultipleTrajectories 10 envHandle qNet0 0.1
       let initialAvgLength = averageTrajectoryLength initialTestTrajectories
-      let initialLengths = map trajectoryLength initialTestTrajectories
-      putStrLn $ "Initial average trajectory length: " ++ show (round initialAvgLength) ++ " steps"
+      let initialLengths = map length initialTestTrajectories
+      putStrLn $ "Initial average trajectory length: " ++ show ((round initialAvgLength) :: Int) ++ " steps"
       putStrLn $ "Initial trajectory lengths: " ++ show initialLengths
       
       -- Show initial Q-values
@@ -418,15 +414,15 @@ main = do
       let batchSize = 32
       let initialBuffer = []
       
-      (finalQNet, finalTargetNet) <- trainDQN qNet0 targetNet0 learningRate gamma initialEpsilon episodes targetUpdateFreq batchSize envHandle initialBuffer
+      (finalQNet, _finalTargetNet) <- trainDQN qNet0 targetNet0 learningRate gamma initialEpsilon episodes targetUpdateFreq batchSize envHandle initialBuffer
       putStrLn "\nDQN training completed!"
       
       -- Evaluate final performance
       putStrLn "\n=== FINAL PERFORMANCE (AFTER DQN TRAINING) ==="
       finalTestTrajectories <- sampleMultipleTrajectories 10 envHandle finalQNet 0.05  -- Very low epsilon for evaluation
       let finalAvgLength = averageTrajectoryLength finalTestTrajectories
-      let finalLengths = map trajectoryLength finalTestTrajectories
-      putStrLn $ "Final average trajectory length: " ++ show (round finalAvgLength) ++ " steps"
+      let finalLengths = map length finalTestTrajectories
+      putStrLn $ "Final average trajectory length: " ++ show (round finalAvgLength :: Int) ++ " steps"
       putStrLn $ "Final trajectory lengths: " ++ show finalLengths
       
       -- Show final Q-values
@@ -438,9 +434,9 @@ main = do
       let performanceImprovementPct = if initialAvgLength /= 0 then (performanceImprovement / initialAvgLength) * 100 else 0
       
       putStrLn $ "\n=== TRAINING SUMMARY ==="
-      putStrLn $ "Performance improvement: " ++ show (round performanceImprovement) ++ " steps"
-      putStrLn $ "Performance improvement: " ++ show (round performanceImprovementPct) ++ "% (" ++ 
-                 show (round initialAvgLength) ++ " → " ++ show (round finalAvgLength) ++ " steps)"
+      putStrLn $ "Performance improvement: " ++ show (round performanceImprovement :: Int) ++ " steps"
+      putStrLn $ "Performance improvement: " ++ show (round performanceImprovementPct :: Int) ++ "% (" ++ 
+                 show (round initialAvgLength :: Int) ++ " → " ++ show (round finalAvgLength :: Int) ++ " steps)"
       
       -- Show Q-value changes
       let initialQList = extract initialQ
