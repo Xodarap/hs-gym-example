@@ -180,21 +180,27 @@ sampleMultipleTrajectories n envHandle dqnNet epsilon = do
 -- TARGET CALCULATION
 -- ============================================================================
 
--- Calculate Q-targets using temporal difference learning
+-- Calculate Q-target for a single experience
+calculateQTarget :: DQNNet -> DQNNet -> Double -> DQNState -> Action -> Reward -> DQNState -> Bool -> (DQNState, R 2)
+calculateQTarget qNet targetNet gamma state action reward nextState done =
+  let currentQ = runDQNNetwork qNet state
+      nextQ = runDQNNetwork targetNet nextState
+      maxNextQ = if done then 0.0 else LA.maxElement (extract nextQ)
+      targetValue = reward + gamma * maxNextQ
+      actionIdx = actionToInt action
+      currentExtracted = extract currentQ
+      target = if actionIdx == 0
+               then vector [targetValue, currentExtracted LA.! 1]
+               else vector [currentExtracted LA.! 0, targetValue]
+  in (state, target)
+
+-- Calculate Q-targets using temporal difference learning (legacy for trajectories)
 calculateQTargets :: DQNNet -> DQNNet -> Double -> Trajectory -> [(DQNState, Action, R 2)]
 calculateQTargets qNet targetNet gamma trajectory = 
   let transitions = zip trajectory (tail trajectory ++ [(vector [0,0,0,0], Action (Number 0), 0)])
   in map (\((state, action, reward), (nextState, _, _)) -> 
-      let currentQ = runDQNNetwork qNet state
-          nextQ = runDQNNetwork targetNet nextState
-          maxNextQ = LA.maxElement (extract nextQ)
-          targetValue = reward + gamma * maxNextQ
-          actionIdx = actionToInt action
-          currentExtracted = extract currentQ
-          target = if actionIdx == 0
-                   then vector [targetValue, currentExtracted LA.! 1]
-                   else vector [currentExtracted LA.! 0, targetValue]
-      in (state, action, target)) (init transitions)
+      let (state', target) = calculateQTarget qNet targetNet gamma state action reward nextState False
+      in (state', action, target)) (init transitions)
 
 -- ============================================================================
 -- BACKPROPAGATION SUPPORT
@@ -241,23 +247,7 @@ trainOnExperiences qNet targetNet learningRate gamma experiences =
   in newNet
   where
     experienceToTarget (state, action, reward, nextState, done) =
-      let currentQ = runDQNNetwork qNet state
-          nextQ = runDQNNetwork targetNet nextState
-          maxNextQ = if done then 0.0 else LA.maxElement (extract nextQ)
-          targetValue = reward + gamma * maxNextQ
-          actionIdx = actionToInt action
-          currentExtracted = extract currentQ
-          target = if actionIdx == 0
-                   then vector [targetValue, currentExtracted LA.! 1]
-                   else vector [currentExtracted LA.! 0, targetValue]
-      in (state, target)
-
--- Train DQN network on trajectory with temporal difference learning (legacy)
-trainOnTrajectory :: DQNNet -> DQNNet -> Double -> Double -> Trajectory -> DQNNet
-trainOnTrajectory qNet targetNet learningRate gamma trajectory = 
-  let trainingPairs = calculateQTargets qNet targetNet gamma trajectory
-      newNet = foldl (\n (state, _, target) -> trainStepMSE learningRate n state target) qNet trainingPairs
-  in newNet
+      calculateQTarget qNet targetNet gamma state action reward nextState done
 
 -- ============================================================================
 -- ENVIRONMENT INTERACTION
@@ -389,11 +379,7 @@ glorotInitLayer = do
 
 -- | Glorot initialization for the entire DQN network
 glorotInitDQNNetwork :: IO DQNNet
-glorotInitDQNNetwork = do
-  layer1 <- glorotInitLayer @4 @64
-  layer2 <- glorotInitLayer @64 @64
-  layer3 <- glorotInitLayer @64 @2
-  return $ Net layer1 layer2 layer3
+glorotInitDQNNetwork = Net <$> glorotInitLayer <*> glorotInitLayer <*> glorotInitLayer
 
 
 
