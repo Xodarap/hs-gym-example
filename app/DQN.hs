@@ -25,13 +25,31 @@ import Data.Proxy
 -- TYPE DEFINITIONS
 -- ============================================================================
 
-type DQNNet o = Network 4 64 64 o
-type DQNCritic = DQNNet 1
-type DQNActor = DQNNet 2
+type DQNNet = Network 4 64 64 2
 type DQNState = R 4
 type Reward = Double
 type Trajectory = [(DQNState, Action, Reward)]
 newtype DiscountedTrajectory = DT Trajectory
+
+-- Experience replay buffer
+type Experience = (DQNState, Action, Reward, DQNState, Bool)  -- (state, action, reward, nextState, done)
+type ReplayBuffer = [Experience]
+
+-- Add experience to replay buffer with maximum size
+addExperience :: Int -> Experience -> ReplayBuffer -> ReplayBuffer
+addExperience maxSize exp buffer = 
+  let newBuffer = exp : buffer
+  in take maxSize newBuffer
+
+-- Sample random batch from replay buffer
+sampleBatch :: Int -> ReplayBuffer -> IO [Experience]
+sampleBatch batchSize buffer = do
+  let bufferSize = length buffer
+  if bufferSize < batchSize
+    then return buffer
+    else do
+      indices <- replicateM batchSize (randomRIO (0, bufferSize - 1))
+      return $ map (buffer !!) indices
 
 -- ============================================================================
 -- UTILITY FUNCTIONS
@@ -60,7 +78,7 @@ softmaxVec v =
   in dvmap (/ sumExp) expVec
 
 -- Generic network execution with ReLU activation
-runDQNNetwork :: forall o. KnownNat o => DQNNet o -> DQNState -> R o
+runDQNNetwork :: DQNNet -> DQNState -> R 2
 runDQNNetwork net input = runLayerNormal (net ^. nLayer3)
                         . reluVec
                         . runLayerNormal (net ^. nLayer2)
@@ -68,18 +86,23 @@ runDQNNetwork net input = runLayerNormal (net ^. nLayer3)
                         . runLayerNormal (net ^. nLayer1)
                         $ input
 
--- Get action probabilities from actor using softmax
-getActionProbs :: DQNActor -> DQNState -> R 2
-getActionProbs net input = softmaxVec (runDQNNetwork net input)
+-- Get Q-values for all actions
+getQValues :: DQNNet -> DQNState -> R 2
+getQValues net input = runDQNNetwork net input
 
--- Sample action from actor probabilities
-sampleActionFromActor :: DQNActor -> DQNState -> IO Action
-sampleActionFromActor net input = do
-  let probs = getActionProbs net input
-  let probList = extract probs
+-- Epsilon-greedy action selection
+selectAction :: DQNNet -> DQNState -> Double -> IO Action
+selectAction net input epsilon = do
   rand <- randomRIO (0.0, 1.0)
-  let action = if rand < (probList LA.! 0) then 0 else 1
-  return $ Action $ Number $ fromIntegral action
+  if rand < epsilon
+    then do
+      actionInt <- randomAction
+      return $ Action $ Number $ fromIntegral actionInt
+    else do
+      let qValues = getQValues net input
+      let qList = extract qValues
+      let bestAction = if (qList LA.! 0) > (qList LA.! 1) then 0 else 1
+      return $ Action $ Number $ fromIntegral bestAction
 
 -- ============================================================================
 -- ACTION SELECTION
@@ -119,13 +142,9 @@ sampleTrajectoryWith actionSelector input transition = do
       nextTrajectory <- sampleTrajectoryWith actionSelector nextState transition
       return ((input, action, reward) : nextTrajectory)
 
--- Trajectory sampling with random actions (for critic)
-sampleTrajectoryRandom :: DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
-sampleTrajectoryRandom = sampleTrajectoryWith (const getRandomAction)
-
--- Trajectory sampling with actor policy
-sampleTrajectoryWithActor :: DQNActor -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
-sampleTrajectoryWithActor net = sampleTrajectoryWith (sampleActionFromActor net)
+-- Trajectory sampling with epsilon-greedy policy
+sampleTrajectoryEpsilonGreedy :: DQNNet -> Double -> DQNState -> (Action -> IO (DQNState, Reward, Bool)) -> IO Trajectory
+sampleTrajectoryEpsilonGreedy net epsilon = sampleTrajectoryWith (\state -> selectAction net state epsilon)
 
 makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
 makeDiscountedTrajectory gamma trajectory = 
@@ -166,56 +185,42 @@ averageTrajectoryLength trajectories =
     then 0.0 
     else fromIntegral (sum (map trajectoryLength trajectories)) / fromIntegral (length trajectories)
 
-sampleMultipleTrajectories :: Int -> Environment -> DQNActor -> IO [Trajectory]
-sampleMultipleTrajectories n envHandle actorNet = do
-  replicateM n (trajectoryFromEnvWithActor envHandle actorNet)
+sampleMultipleTrajectories :: Int -> Environment -> DQNNet -> Double -> IO [Trajectory]
+sampleMultipleTrajectories n envHandle dqnNet epsilon = do
+  replicateM n (trajectoryFromEnv dqnNet epsilon envHandle)
 
 -- ============================================================================
 -- TARGET CALCULATION
 -- ============================================================================
 
-calculateQTargets :: forall o. KnownNat o => Double -> Trajectory -> [(DQNState, R o)]
-calculateQTargets gamma trajectory = 
-  let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
-  in map (\(state, _, discountedReward) -> 
-      let target = vector [discountedReward]
-      in (state, target)) discountedTrajectory
-
-calculateActionQTargets :: DQNActor -> Double -> Trajectory -> [(DQNState, R 2)]
-calculateActionQTargets net gamma trajectory = 
-  let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
-  in map (\(state, action, discountedReward) -> 
-      let predicted = runDQNNetwork net state
-          extracted = extract predicted
-          target = if (actionToInt action) == 0 
-                   then vector [discountedReward, extracted LA.! 1] 
-                   else vector [extracted LA.! 0, discountedReward]
-      in (state, target)) discountedTrajectory
+-- Calculate Q-targets using temporal difference learning
+calculateQTargets :: DQNNet -> DQNNet -> Double -> Trajectory -> [(DQNState, Action, R 2)]
+calculateQTargets qNet targetNet gamma trajectory = 
+  let transitions = zip trajectory (tail trajectory ++ [(vector [0,0,0,0], Action (Number 0), 0)])
+  in map (\((state, action, reward), (nextState, _, _)) -> 
+      let currentQ = getQValues qNet state
+          nextQ = getQValues targetNet nextState
+          maxNextQ = LA.maxElement (extract nextQ)
+          targetValue = reward + gamma * maxNextQ
+          actionIdx = actionToInt action
+          currentExtracted = extract currentQ
+          target = if actionIdx == 0
+                   then vector [targetValue, currentExtracted LA.! 1]
+                   else vector [currentExtracted LA.! 0, targetValue]
+      in (state, action, target)) (init transitions)
 
 -- ============================================================================
 -- LOSS CALCULATION
 -- ============================================================================
 
-averageMSELoss :: forall o. KnownNat o => DQNNet o -> Double -> Trajectory -> Double
-averageMSELoss net gamma trajectory = 
-  let (DT discountedTrajectory) = makeDiscountedTrajectory gamma trajectory
-      losses = map calculateLoss discountedTrajectory
-  in sum losses / fromIntegral (length losses)
-  where
-    calculateLoss (state, _, discountedReward) = 
-      let predictedQ = runDQNNetwork net state
-          predictedValue = (extract predictedQ) LA.! 0
-          err = predictedValue - discountedReward
-      in err * err
-
-averageActorMSELoss :: DQNActor -> Double -> Trajectory -> Double
-averageActorMSELoss net gamma trajectory = 
-  let trainingPairs = calculateActionQTargets net gamma trajectory
+averageMSELoss :: DQNNet -> DQNNet -> Double -> Trajectory -> Double
+averageMSELoss qNet targetNet gamma trajectory = 
+  let trainingPairs = calculateQTargets qNet targetNet gamma trajectory
       losses = map calculateLoss trainingPairs
-  in sum losses / fromIntegral (length losses)
+  in if null losses then 0.0 else sum losses / fromIntegral (length losses)
   where
-    calculateLoss (state, target) = 
-      let predicted = runDQNNetwork net state
+    calculateLoss (state, _, target) = 
+      let predicted = runDQNNetwork qNet state
           diff = extract predicted - extract target
           squaredDiff = LA.toList diff
       in sum (map (^2) squaredDiff) / 2.0
@@ -234,10 +239,7 @@ reluBackpropVec = liftOp1 . op1 $ \v ->
   in (reluVec, grad)
 
 -- Network execution for backpropagation
-runNetworkForQ :: (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o, Reifies s W)
-               => BVar s (Network i h1 h2 o)
-               -> R i
-               -> BVar s (R o)
+runNetworkForQ :: (Reifies s W) => BVar s DQNNet -> R 4 -> BVar s (R 2)
 runNetworkForQ n input = runLayer (n ^^. nLayer3)
                        . reluBackpropVec
                        . runLayer (n ^^. nLayer2)
@@ -247,8 +249,7 @@ runNetworkForQ n input = runLayer (n ^^. nLayer3)
                        $ input
 
 -- MSE loss function for backpropagation
-mseErr :: (KnownNat i, KnownNat h1, KnownNat h2, KnownNat o, Reifies s W)
-       => R i -> R o -> BVar s (Network i h1 h2 o) -> BVar s Double
+mseErr :: (Reifies s W) => R 4 -> R 2 -> BVar s DQNNet -> BVar s Double
 mseErr input target net = 
   let predicted = runNetworkForQ net input
       diff = predicted - constVar target
@@ -259,35 +260,80 @@ mseErr input target net =
 -- ============================================================================
 
 -- MSE-based training step for Q-value regression
-trainStepMSE :: forall o. KnownNat o => Double -> DQNNet o -> DQNState -> R o -> DQNNet o
+trainStepMSE :: Double -> DQNNet -> DQNState -> R 2 -> DQNNet
 trainStepMSE learningRate net input target = 
   net - realToFrac learningRate * gradBP (mseErr input target) net
 
--- MSE-based training step for actor
-trainStepActorMSE :: Double -> DQNActor -> DQNState -> R 2 -> DQNActor
-trainStepActorMSE = trainStepMSE
-
--- Train network on trajectory with MSE loss
-trainOnTrajectory :: forall o. KnownNat o => DQNNet o -> Double -> Double -> Trajectory -> DQNNet o
-trainOnTrajectory net learningRate gamma trajectory = 
-  let trainingPairs = calculateQTargets gamma trajectory
-      -- Use MSE loss for Q-value regression
-      newNet = foldl (\n (state, target) -> trainStepMSE learningRate n state target) net trainingPairs
+-- Train DQN network using experience replay
+trainOnExperiences :: DQNNet -> DQNNet -> Double -> Double -> [Experience] -> DQNNet
+trainOnExperiences qNet targetNet learningRate gamma experiences = 
+  let trainingPairs = map experienceToTarget experiences
+      newNet = foldl (\n (state, target) -> trainStepMSE learningRate n state target) qNet trainingPairs
   in newNet
+  where
+    experienceToTarget (state, action, reward, nextState, done) =
+      let currentQ = getQValues qNet state
+          nextQ = getQValues targetNet nextState
+          maxNextQ = if done then 0.0 else LA.maxElement (extract nextQ)
+          targetValue = reward + gamma * maxNextQ
+          actionIdx = actionToInt action
+          currentExtracted = extract currentQ
+          target = if actionIdx == 0
+                   then vector [targetValue, currentExtracted LA.! 1]
+                   else vector [currentExtracted LA.! 0, targetValue]
+      in (state, target)
 
-trainActorOnTrajectory :: DQNActor -> Double -> Double -> Trajectory -> DQNActor
-trainActorOnTrajectory net learningRate gamma trajectory = 
-  let trainingPairs = calculateActionQTargets net gamma trajectory
-      newNet = foldl (\n (state, target) -> trainStepActorMSE learningRate n state target) net trainingPairs
+-- Train DQN network on trajectory with temporal difference learning (legacy)
+trainOnTrajectory :: DQNNet -> DQNNet -> Double -> Double -> Trajectory -> DQNNet
+trainOnTrajectory qNet targetNet learningRate gamma trajectory = 
+  let trainingPairs = calculateQTargets qNet targetNet gamma trajectory
+      newNet = foldl (\n (state, _, target) -> trainStepMSE learningRate n state target) qNet trainingPairs
   in newNet
 
 -- ============================================================================
 -- ENVIRONMENT INTERACTION
 -- ============================================================================
 
--- Generic trajectory generation from environment with custom action selector
-trajectoryFromEnvWith :: (DQNState -> IO Action) -> Environment -> IO Trajectory
-trajectoryFromEnvWith actionSelector envHandle = do
+-- Generate experiences for replay buffer
+generateExperiences :: DQNNet -> Double -> Int -> Environment -> ReplayBuffer -> IO ReplayBuffer
+generateExperiences net epsilon numSteps envHandle buffer = do
+  initialState <- Gym.Environment.reset envHandle
+  case initialState of
+    Left err -> do
+      putStrLn $ "Reset error: " ++ show err
+      return buffer
+    Right obs -> do
+      case parseObservation obs of
+        Nothing -> do
+          putStrLn $ "Parsing returned nothing"
+          return buffer
+        Just state -> do
+          let stateVec = vectorFromList state
+          collectExperiences net epsilon numSteps envHandle stateVec buffer
+
+-- Collect experiences step by step
+collectExperiences :: DQNNet -> Double -> Int -> Environment -> DQNState -> ReplayBuffer -> IO ReplayBuffer
+collectExperiences _ _ 0 _ _ buffer = return buffer
+collectExperiences net epsilon steps envHandle currentState buffer = do
+  action <- selectAction net currentState epsilon
+  (nextState, reward, done) <- makeTransition envHandle action
+  let experience = (currentState, action, reward, nextState, done)
+  let newBuffer = addExperience 10000 experience buffer  -- Max buffer size of 10k
+  
+  if done
+    then do
+      -- Reset environment and continue
+      resetResult <- Gym.Environment.reset envHandle
+      case resetResult of
+        Left _ -> return newBuffer
+        Right obs -> case parseObservation obs of
+          Nothing -> return newBuffer
+          Just state -> collectExperiences net epsilon (steps - 1) envHandle (vectorFromList state) newBuffer
+    else collectExperiences net epsilon (steps - 1) envHandle nextState newBuffer
+
+-- Generate trajectory from environment with epsilon-greedy policy  
+trajectoryFromEnv :: DQNNet -> Double -> Environment -> IO Trajectory
+trajectoryFromEnv net epsilon envHandle = do
   initialState <- Gym.Environment.reset envHandle
   case initialState of
     Left err -> do
@@ -300,131 +346,53 @@ trajectoryFromEnvWith actionSelector envHandle = do
           return []
         Just state -> do
           let stateVec = vectorFromList state
-          sampleTrajectoryWith actionSelector stateVec (makeTransition envHandle)
+          sampleTrajectoryEpsilonGreedy net epsilon stateVec (makeTransition envHandle)
 
--- Trajectory using random actions (for critic training)
-trajectoryFromEnvRandom :: Environment -> IO Trajectory
-trajectoryFromEnvRandom = trajectoryFromEnvWith (const getRandomAction)
+-- DQN training with experience replay and target network updates
+trainDQN :: DQNNet -> DQNNet -> Double -> Double -> Double -> Int -> Int -> Int -> Environment -> ReplayBuffer -> IO (DQNNet, DQNNet)
+trainDQN qNet targetNet learningRate gamma epsilon episodes targetUpdateFreq batchSize envHandle buffer = 
+  trainDQNEpisodes qNet targetNet learningRate gamma epsilon episodes targetUpdateFreq batchSize envHandle buffer 0
 
--- Trajectory using actor policy
-trajectoryFromEnvWithActor :: Environment -> DQNActor -> IO Trajectory
-trajectoryFromEnvWithActor envHandle net = trajectoryFromEnvWith (sampleActionFromActor net) envHandle
-
-trainForEpochs :: forall o. KnownNat o => DQNNet o -> Double -> Double -> Int -> Environment -> IO (DQNNet o)
-trainForEpochs net _ _ 0 _ = return net
-trainForEpochs net learningRate gamma epochs envHandle = do
-  trajectory <- trajectoryFromEnvRandom envHandle
-  let newNet = trainOnTrajectory net learningRate gamma trajectory
+trainDQNEpisodes :: DQNNet -> DQNNet -> Double -> Double -> Double -> Int -> Int -> Int -> Environment -> ReplayBuffer -> Int -> IO (DQNNet, DQNNet)
+trainDQNEpisodes qNet targetNet _ _ _ 0 _ _ _ buffer _ = return (qNet, targetNet)
+trainDQNEpisodes qNet targetNet learningRate gamma epsilon episodes targetUpdateFreq batchSize envHandle buffer episodeCount = do
+  -- Collect experiences
+  newBuffer <- generateExperiences qNet epsilon 100 envHandle buffer
   
-  -- Report progress every 10 epochs
-  if epochs `mod` 10 == 0
+  -- Train on batch if buffer has enough experiences
+  newQNet <- if length newBuffer >= batchSize
     then do
-      let sampleQ = runDQNNetwork newNet (vector [0.0, 0.0, 0.0, 0.0])
-      let mseLoss = averageMSELoss newNet gamma trajectory
-      putStrLn $ "Epoch " ++ show (101 - epochs) ++ 
-                  ", Sample Q-value: " ++ show (extract sampleQ) ++
-                  ", MSE Loss: " ++ show mseLoss
+      batch <- sampleBatch batchSize newBuffer
+      return $ trainOnExperiences qNet targetNet learningRate gamma batch
+    else return qNet
+  
+  -- Update target network periodically
+  newTargetNet <- if (episodeCount + 1) `mod` targetUpdateFreq == 0
+    then do
+      putStrLn $ "Updating target network at episode " ++ show (episodeCount + 1)
+      return newQNet
+    else return targetNet
+  
+  -- Report progress
+  if (episodeCount + 1) `mod` 10 == 0
+    then do
+      let sampleQ = runDQNNetwork newQNet (vector [0.0, 0.0, 0.0, 0.0])
+      trajectory <- trajectoryFromEnv newQNet 0.1 envHandle  -- Low epsilon for evaluation
+      let trajectoryLength = length trajectory
+      putStrLn $ "Episode " ++ show (episodeCount + 1) ++ 
+                  ", Q-values: " ++ show (extract sampleQ) ++
+                  ", Trajectory length: " ++ show trajectoryLength ++
+                  ", Buffer size: " ++ show (length newBuffer)
     else return ()
   
-  trainForEpochs newNet learningRate gamma (epochs - 1) envHandle
+  -- Decay epsilon
+  let newEpsilon = max 0.01 (epsilon * 0.995)
+  
+  trainDQNEpisodes newQNet newTargetNet learningRate gamma newEpsilon (episodes - 1) targetUpdateFreq batchSize envHandle newBuffer (episodeCount + 1)
 
--- Training function for actor
-trainActorForEpochs :: DQNActor -> Double -> Double -> Int -> Environment -> IO DQNActor
-trainActorForEpochs net _ _ 0 _ = return net
-trainActorForEpochs net learningRate gamma epochs envHandle = do
-  trajectory <- trajectoryFromEnvWithActor envHandle net
-  let newNet = trainActorOnTrajectory net learningRate gamma trajectory
-  
-  -- Report progress every 10 epochs
-  if (101 - epochs) `mod` 10 == 0
-    then do
-      let sampleProbs = getActionProbs newNet (vector [0.0, 0.0, 0.0, 0.0])
-      let actorLoss = averageActorMSELoss newNet gamma trajectory
-      putStrLn $ "Actor Epoch " ++ show (101 - epochs) ++ 
-                  ", Sample Action Probs: " ++ show (extract sampleProbs) ++
-                  ", Actor MSE Loss: " ++ show actorLoss
-    else return ()
-  
-  trainActorForEpochs newNet learningRate gamma (epochs - 1) envHandle
 
--- Combined training function for both critic and actor
-trainBothNetworks :: DQNCritic -> DQNActor -> Double -> Double -> Int -> Environment -> IO (DQNCritic, DQNActor)
-trainBothNetworks criticNet actorNet _ _ 0 _ = return (criticNet, actorNet)
-trainBothNetworks criticNet actorNet learningRate gamma epochs envHandle = do
-  -- Train critic with random exploration
-  criticTrajectory <- trajectoryFromEnvRandom envHandle
-  let newCriticNet = trainOnTrajectory criticNet learningRate gamma criticTrajectory
-  
-  -- Train actor with its own policy
-  actorTrajectory <- trajectoryFromEnvWithActor envHandle actorNet
-  let newActorNet = trainActorOnTrajectory actorNet learningRate gamma actorTrajectory
-  
-  -- Report progress every 10 epochs
-  if (epochs `mod` 10 == 0) || (epochs <= 10)
-    then do
-      let sampleQ = runDQNNetwork newCriticNet (vector [0.0, 0.0, 0.0, 0.0])
-      let criticLoss = averageMSELoss newCriticNet gamma criticTrajectory
-      let sampleProbs = getActionProbs newActorNet (vector [0.0, 0.0, 0.0, 0.0])
-      let actorLoss = averageActorMSELoss newActorNet gamma actorTrajectory
-      putStrLn $ "Epoch " ++ show epochs ++ 
-                  " - Critic Q: " ++ show (extract sampleQ) ++
-                  ", Critic Loss: " ++ show criticLoss ++
-                  " | Actor Probs: " ++ show (extract sampleProbs) ++
-                  ", Actor Loss: " ++ show actorLoss
-    else return ()
-  
-  trainBothNetworks newCriticNet newActorNet learningRate gamma (epochs - 1) envHandle
 
--- Actor-Critic training function: train actor for 100 epochs, then use it for critic training
-trainActorCritic :: DQNCritic -> DQNActor -> Double -> Double -> Int -> Environment -> IO (DQNCritic, DQNActor)
-trainActorCritic criticNet actorNet _ _ 0 _ = return (criticNet, actorNet)
-trainActorCritic criticNet actorNet learningRate gamma cycles envHandle = do
-  putStrLn $ "\n=== CYCLE " ++ show (cycles) ++ " ==="
-  
-  -- Phase 1: Train actor for 100 epochs
-  putStrLn "Phase 1: Training Actor for 100 epochs..."
-  trainedActor <- trainActorForEpochs actorNet learningRate gamma 100 envHandle
-  
-  -- Evaluate actor performance with multiple trajectories
-  putStrLn "Evaluating Actor performance..."
-  testTrajectories <- sampleMultipleTrajectories 10 envHandle trainedActor
-  let avgLength = averageTrajectoryLength testTrajectories
-  let lengths = map trajectoryLength testTrajectories
-  putStrLn $ "  Average trajectory length: " ++ show (round avgLength) ++ " steps"
-  putStrLn $ "  Trajectory lengths: " ++ show lengths
-  
-  -- Phase 2: Train critic using the trained actor's policy for 100 epochs
-  putStrLn "Phase 2: Training Critic using Actor's policy for 100 epochs..."
-  trainedCritic <- trainCriticWithActorPolicy criticNet trainedActor learningRate gamma 100 envHandle
-  
-  -- Show cycle results
-  let sampleQ = runDQNNetwork trainedCritic (vector [0.0, 0.0, 0.0, 0.0])
-  let sampleProbs = getActionProbs trainedActor (vector [0.0, 0.0, 0.0, 0.0])
-  putStrLn $ "Cycle " ++ show cycles ++ " completed:"
-  putStrLn $ "  Critic Q-prediction: " ++ show (extract sampleQ)
-  putStrLn $ "  Actor action probs: " ++ show (extract sampleProbs)
-  putStrLn $ "  Performance: " ++ show (round avgLength) ++ " steps average"
-  
-  trainActorCritic trainedCritic trainedActor learningRate gamma (cycles - 1) envHandle
 
--- Train critic using actor's policy for action selection
-trainCriticWithActorPolicy :: DQNCritic -> DQNActor -> Double -> Double -> Int -> Environment -> IO DQNCritic
-trainCriticWithActorPolicy criticNet _ _ _ 0 _ = return criticNet
-trainCriticWithActorPolicy criticNet actorNet learningRate gamma epochs envHandle = do
-  trajectory <- trajectoryFromEnvWithActor envHandle actorNet
-  let newCriticNet = trainOnTrajectory criticNet learningRate gamma trajectory
-  
-  -- Report progress every 25 epochs
-  if epochs `mod` 25 == 0
-    then do
-      let sampleQ = runDQNNetwork newCriticNet (vector [0.0, 0.0, 0.0, 0.0])
-      let criticLoss = averageMSELoss newCriticNet gamma trajectory
-      putStrLn $ "  Critic Epoch " ++ show (101 - epochs) ++ 
-                  " - Q: " ++ show (extract sampleQ) ++
-                  ", Loss: " ++ show criticLoss
-    else return ()
-  
-  trainCriticWithActorPolicy newCriticNet actorNet learningRate gamma (epochs - 1) envHandle
 
 -- ============================================================================
 -- GLOROT INITIALIZATION
@@ -450,112 +418,82 @@ glorotInitLayer = do
   
   return $ Layer weights biases
 
--- | Glorot initialization for the entire network
-glorotInitNetwork :: forall o. KnownNat o => IO (DQNNet o)
-glorotInitNetwork = do
+-- | Glorot initialization for the entire DQN network
+glorotInitDQNNetwork :: IO DQNNet
+glorotInitDQNNetwork = do
   layer1 <- glorotInitLayer @4 @64
   layer2 <- glorotInitLayer @64 @64
-  layer3 <- glorotInitLayer @64 @o
+  layer3 <- glorotInitLayer @64 @2
   return $ Net layer1 layer2 layer3
 
 
 
 main :: IO ()
 main = do  
-  putStrLn "Initializing neural networks with Glorot initialization..."
-  criticNet0 <- glorotInitNetwork :: IO DQNCritic
-  actorNet0 <- glorotInitNetwork :: IO DQNActor
+  putStrLn "Initializing DQN with Glorot initialization..."
+  qNet0 <- glorotInitDQNNetwork
+  targetNet0 <- glorotInitDQNNetwork  -- Initialize target network
   env <- Gym.Environment.makeEnv "CartPole-v1"
   case env of
     Left err -> do
       putStrLn $ "Environment error: " ++ show err
       return ()
     Right envHandle -> do
-      initialState <- Gym.Environment.reset envHandle
-      case initialState of
-        Left err -> do
-          putStrLn $ "Reset error: " ++ show err
-          return ()
-        Right obs -> do
-          case parseObservation obs of
-            Nothing -> do
-              putStrLn $ "Parsing returned nothing"
-              return ()
-            Just state -> do
-              let stateVec = vectorFromList state
-              
-              -- Sample initial trajectories to show before training
-              criticTrajectory <- sampleTrajectoryRandom stateVec (makeTransition envHandle)
-              actorTrajectory <- trajectoryFromEnvWithActor envHandle actorNet0
-              
-              -- Evaluate initial actor performance
-              putStrLn "\n=== INITIAL PERFORMANCE (BEFORE TRAINING) ==="
-              initialTestTrajectories <- sampleMultipleTrajectories 10 envHandle actorNet0
-              let initialAvgLength = averageTrajectoryLength initialTestTrajectories
-              let initialLengths = map trajectoryLength initialTestTrajectories
-              putStrLn $ "Initial average trajectory length: " ++ show (round initialAvgLength) ++ " steps"
-              putStrLn $ "Initial trajectory lengths: " ++ show initialLengths
-              
-              putStrLn "\n=== INITIAL LOSSES (BEFORE TRAINING) ==="
-              let initialCriticLoss = averageMSELoss criticNet0 0.99 criticTrajectory
-              let initialActorLoss = averageActorMSELoss actorNet0 0.99 actorTrajectory
-              putStrLn $ "Initial Critic MSE Loss: " ++ show initialCriticLoss
-              putStrLn $ "Initial Actor MSE Loss: " ++ show initialActorLoss
-              
-              -- Show initial predictions
-              let sampleState = vector [0.0, 0.0, 0.0, 0.0]
-              let initialCriticQ = runDQNNetwork criticNet0 sampleState
-              let initialActorProbs = getActionProbs actorNet0 sampleState
-              putStrLn $ "Initial Critic Q-value: " ++ show (extract initialCriticQ)
-              putStrLn $ "Initial Actor action probs: " ++ show (extract initialActorProbs)
-              
-              -- Actor-Critic training: 3 cycles of (train actor 100 epochs, then use it for critic 100 epochs)
-              putStrLn "\n=== ACTOR-CRITIC TRAINING (3 CYCLES) ==="
-              putStrLn "Each cycle: Train Actor (100 epochs) → Train Critic using Actor's policy (100 epochs)"
-              (finalCritic, finalActor) <- trainActorCritic criticNet0 actorNet0 0.001 0.99 3 envHandle
-              putStrLn "\nActor-Critic training completed!"
-              
-              -- Evaluate final actor performance
-              putStrLn "\n=== FINAL PERFORMANCE (AFTER ACTOR-CRITIC TRAINING) ==="
-              finalTestTrajectories <- sampleMultipleTrajectories 10 envHandle finalActor
-              let finalAvgLength = averageTrajectoryLength finalTestTrajectories
-              let finalLengths = map trajectoryLength finalTestTrajectories
-              putStrLn $ "Final average trajectory length: " ++ show (round finalAvgLength) ++ " steps"
-              putStrLn $ "Final trajectory lengths: " ++ show finalLengths
-              
-              -- Sample final trajectories using the trained networks
-              finalCriticTrajectory <- trajectoryFromEnvWithActor envHandle finalActor
-              finalActorTrajectory <- trajectoryFromEnvWithActor envHandle finalActor
-              
-              putStrLn "\n=== FINAL COMPARISON (AFTER ACTOR-CRITIC TRAINING) ==="
-              let finalCriticLoss = averageMSELoss finalCritic 0.99 finalCriticTrajectory
-              let finalActorLoss = averageActorMSELoss finalActor 0.99 finalActorTrajectory
-              let criticImprovement = initialCriticLoss - finalCriticLoss
-              let actorImprovement = initialActorLoss - finalActorLoss
-              let performanceImprovement = finalAvgLength - initialAvgLength
-              
-              putStrLn $ "Final Critic MSE Loss: " ++ show finalCriticLoss
-              putStrLn $ "Critic Loss Improvement: " ++ show criticImprovement
-              putStrLn $ "Final Actor MSE Loss: " ++ show finalActorLoss
-              putStrLn $ "Actor Loss Improvement: " ++ show actorImprovement
-              putStrLn $ "Performance improvement: " ++ show (round performanceImprovement) ++ " steps"
-              
-              -- Show final predictions
-              let finalCriticQ = runDQNNetwork finalCritic sampleState
-              let finalActorProbs = getActionProbs finalActor sampleState
-              putStrLn $ "\nFinal Critic Q-value prediction: " ++ show (extract finalCriticQ)
-              putStrLn $ "Final Actor action probabilities: " ++ show (extract finalActorProbs)
-              
-              -- Show improvement percentages
-              let criticImprovementPct = if initialCriticLoss /= 0 then (criticImprovement / initialCriticLoss) * 100 else 0
-              let actorImprovementPct = if initialActorLoss /= 0 then (actorImprovement / initialActorLoss) * 100 else 0
-              let performanceImprovementPct = if initialAvgLength /= 0 then (performanceImprovement / initialAvgLength) * 100 else 0
-              putStrLn $ "\nImprovement Summary:"
-              putStrLn $ "Critic: " ++ show (round criticImprovementPct) ++ "% improvement"
-              putStrLn $ "Actor: " ++ show (round actorImprovementPct) ++ "% improvement"
-              putStrLn $ "Performance: " ++ show (round performanceImprovementPct) ++ "% improvement (" ++ 
-                         show (round initialAvgLength) ++ " → " ++ show (round finalAvgLength) ++ " steps)"
-              
-              closeEnv envHandle
-              return ()
+      putStrLn "\n=== INITIAL PERFORMANCE (BEFORE TRAINING) ==="
+      -- Test initial performance with low epsilon
+      initialTestTrajectories <- sampleMultipleTrajectories 10 envHandle qNet0 0.1
+      let initialAvgLength = averageTrajectoryLength initialTestTrajectories
+      let initialLengths = map trajectoryLength initialTestTrajectories
+      putStrLn $ "Initial average trajectory length: " ++ show (round initialAvgLength) ++ " steps"
+      putStrLn $ "Initial trajectory lengths: " ++ show initialLengths
+      
+      -- Show initial Q-values
+      let sampleState = vector [0.0, 0.0, 0.0, 0.0]
+      let initialQ = getQValues qNet0 sampleState
+      putStrLn $ "Initial Q-values: " ++ show (extract initialQ)
+      
+      -- DQN Training
+      putStrLn "\n=== DQN TRAINING ==="
+      putStrLn "Training with experience replay, target network updates, and epsilon decay"
+      let learningRate = 0.001
+      let gamma = 0.99
+      let initialEpsilon = 1.0
+      let episodes = 500
+      let targetUpdateFreq = 50  -- Update target network every 50 episodes
+      let batchSize = 32
+      let initialBuffer = []
+      
+      (finalQNet, finalTargetNet) <- trainDQN qNet0 targetNet0 learningRate gamma initialEpsilon episodes targetUpdateFreq batchSize envHandle initialBuffer
+      putStrLn "\nDQN training completed!"
+      
+      -- Evaluate final performance
+      putStrLn "\n=== FINAL PERFORMANCE (AFTER DQN TRAINING) ==="
+      finalTestTrajectories <- sampleMultipleTrajectories 10 envHandle finalQNet 0.05  -- Very low epsilon for evaluation
+      let finalAvgLength = averageTrajectoryLength finalTestTrajectories
+      let finalLengths = map trajectoryLength finalTestTrajectories
+      putStrLn $ "Final average trajectory length: " ++ show (round finalAvgLength) ++ " steps"
+      putStrLn $ "Final trajectory lengths: " ++ show finalLengths
+      
+      -- Show final Q-values
+      let finalQ = getQValues finalQNet sampleState
+      putStrLn $ "Final Q-values: " ++ show (extract finalQ)
+      
+      -- Calculate improvement
+      let performanceImprovement = finalAvgLength - initialAvgLength
+      let performanceImprovementPct = if initialAvgLength /= 0 then (performanceImprovement / initialAvgLength) * 100 else 0
+      
+      putStrLn $ "\n=== TRAINING SUMMARY ==="
+      putStrLn $ "Performance improvement: " ++ show (round performanceImprovement) ++ " steps"
+      putStrLn $ "Performance improvement: " ++ show (round performanceImprovementPct) ++ "% (" ++ 
+                 show (round initialAvgLength) ++ " → " ++ show (round finalAvgLength) ++ " steps)"
+      
+      -- Show Q-value changes
+      let initialQList = extract initialQ
+      let finalQList = extract finalQ
+      putStrLn $ "Q-value changes:"
+      putStrLn $ "  Action 0: " ++ show (initialQList LA.! 0) ++ " → " ++ show (finalQList LA.! 0)
+      putStrLn $ "  Action 1: " ++ show (initialQList LA.! 1) ++ " → " ++ show (finalQList LA.! 1)
+      
+      closeEnv envHandle
+      return ()
         
