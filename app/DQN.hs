@@ -135,7 +135,10 @@ sampleTrajectoryEpsilonGreedy net epsilon = sampleTrajectoryWith (\state -> sele
 
 makeDiscountedTrajectory :: Double -> Trajectory -> DiscountedTrajectory
 makeDiscountedTrajectory gamma trajectory = 
-  let inner ((ti, tout, treward):u:us) = let r@((_, _, ur):_) = inner (u:us) in (ti, tout, gamma * ur + treward) : r
+  let inner ((ti, tout, treward):u:us) = 
+        case inner (u:us) of
+          ((_, _, ur):_) -> (ti, tout, gamma * ur + treward) : inner (u:us)
+          [] -> [(ti, tout, treward)]
       inner [x] = [x]
       inner [] = []
   in DT $ inner trajectory
