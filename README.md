@@ -1,10 +1,10 @@
 # Haskell Deep Q-Network (DQN)
 
-A complete Deep Q-Network implementation in Haskell using backprop for automatic differentiation and gym-hs for OpenAI Gymnasium environment integration.
+A complete Deep Q-Network implementation in Haskell using backprop for automatic differentiation and [haskell-gymnasium](https://github.com/Xodarap/haskell-gymnasium) for OpenAI Gymnasium environment integration.
 
 ## Overview
 
-This project implements a Deep Q-Network agent that learns to play CartPole-v1 through reinforcement learning. The implementation features experience replay, target networks, epsilon-greedy exploration, and proper Q-learning with temporal difference updates.
+This project implements a Deep Q-Network agent that learns to play CartPole-v1 through reinforcement learning.
 
 ## Installation
 
