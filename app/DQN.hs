@@ -55,8 +55,8 @@ sampleBatch batchSize buffer = do
 -- UTILITY FUNCTIONS
 -- ============================================================================
 
-randomAction :: IO Int
-randomAction = randomRIO (0, 1)
+randomAction :: IO Action
+randomAction = Action . Number . fromIntegral <$> randomRIO (0 :: Int, 1)
 
 vectorFromList :: [Double] -> R 4
 vectorFromList [a, b, c, d] = vector [a, b, c, d]
@@ -86,20 +86,14 @@ runDQNNetwork net input = runLayerNormal (net ^. nLayer3)
                         . runLayerNormal (net ^. nLayer1)
                         $ input
 
--- Get Q-values for all actions
-getQValues :: DQNNet -> DQNState -> R 2
-getQValues net input = runDQNNetwork net input
-
 -- Epsilon-greedy action selection
 selectAction :: DQNNet -> DQNState -> Double -> IO Action
 selectAction net input epsilon = do
   rand <- randomRIO (0.0, 1.0)
   if rand < epsilon
-    then do
-      actionInt <- randomAction
-      return $ Action $ Number $ fromIntegral actionInt
+    then randomAction
     else do
-      let qValues = getQValues net input
+      let qValues = runDQNNetwork net input
       let qList = extract qValues
       let bestAction = if (qList LA.! 0) > (qList LA.! 1) then 0 else 1
       return $ Action $ Number $ fromIntegral bestAction
@@ -107,13 +101,6 @@ selectAction net input epsilon = do
 -- ============================================================================
 -- ACTION SELECTION
 -- ============================================================================
-
--- Random action selection for critic exploration
-getRandomAction :: IO Action
-getRandomAction = do
-  actionInt <- randomAction
-  return $ Action $ Number $ fromIntegral actionInt
-
 
 makeTransition :: Environment -> Action -> IO (DQNState, Reward, Bool)
 makeTransition env action = do
@@ -198,8 +185,8 @@ calculateQTargets :: DQNNet -> DQNNet -> Double -> Trajectory -> [(DQNState, Act
 calculateQTargets qNet targetNet gamma trajectory = 
   let transitions = zip trajectory (tail trajectory ++ [(vector [0,0,0,0], Action (Number 0), 0)])
   in map (\((state, action, reward), (nextState, _, _)) -> 
-      let currentQ = getQValues qNet state
-          nextQ = getQValues targetNet nextState
+      let currentQ = runDQNNetwork qNet state
+          nextQ = runDQNNetwork targetNet nextState
           maxNextQ = LA.maxElement (extract nextQ)
           targetValue = reward + gamma * maxNextQ
           actionIdx = actionToInt action
@@ -208,24 +195,6 @@ calculateQTargets qNet targetNet gamma trajectory =
                    then vector [targetValue, currentExtracted LA.! 1]
                    else vector [currentExtracted LA.! 0, targetValue]
       in (state, action, target)) (init transitions)
-
--- ============================================================================
--- LOSS CALCULATION
--- ============================================================================
-
-averageMSELoss :: DQNNet -> DQNNet -> Double -> Trajectory -> Double
-averageMSELoss qNet targetNet gamma trajectory = 
-  let trainingPairs = calculateQTargets qNet targetNet gamma trajectory
-      losses = map calculateLoss trainingPairs
-  in if null losses then 0.0 else sum losses / fromIntegral (length losses)
-  where
-    calculateLoss (state, _, target) = 
-      let predicted = runDQNNetwork qNet state
-          diff = extract predicted - extract target
-          squaredDiff = LA.toList diff
-      in sum (map (^2) squaredDiff) / 2.0
-
-
 
 -- ============================================================================
 -- BACKPROPAGATION SUPPORT
@@ -272,8 +241,8 @@ trainOnExperiences qNet targetNet learningRate gamma experiences =
   in newNet
   where
     experienceToTarget (state, action, reward, nextState, done) =
-      let currentQ = getQValues qNet state
-          nextQ = getQValues targetNet nextState
+      let currentQ = runDQNNetwork qNet state
+          nextQ = runDQNNetwork targetNet nextState
           maxNextQ = if done then 0.0 else LA.maxElement (extract nextQ)
           targetValue = reward + gamma * maxNextQ
           actionIdx = actionToInt action
@@ -449,7 +418,7 @@ main = do
       
       -- Show initial Q-values
       let sampleState = vector [0.0, 0.0, 0.0, 0.0]
-      let initialQ = getQValues qNet0 sampleState
+      let initialQ = runDQNNetwork qNet0 sampleState
       putStrLn $ "Initial Q-values: " ++ show (extract initialQ)
       
       -- DQN Training
@@ -475,7 +444,7 @@ main = do
       putStrLn $ "Final trajectory lengths: " ++ show finalLengths
       
       -- Show final Q-values
-      let finalQ = getQValues finalQNet sampleState
+      let finalQ = runDQNNetwork finalQNet sampleState
       putStrLn $ "Final Q-values: " ++ show (extract finalQ)
       
       -- Calculate improvement
