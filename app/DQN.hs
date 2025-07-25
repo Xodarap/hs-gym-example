@@ -265,8 +265,7 @@ trainStepMSE learningRate net input target =
 
 -- MSE-based training step for actor
 trainStepActorMSE :: Double -> DQNActor -> DQNState -> R 2 -> DQNActor
-trainStepActorMSE learningRate net input target = 
-  net - realToFrac learningRate * gradBP (mseErr input target) net
+trainStepActorMSE = trainStepMSE
 
 -- Train network on trajectory with MSE loss
 trainOnTrajectory :: forall o. KnownNat o => DQNNet o -> Double -> Double -> Trajectory -> DQNNet o
@@ -318,7 +317,7 @@ trainForEpochs net learningRate gamma epochs envHandle = do
   let newNet = trainOnTrajectory net learningRate gamma trajectory
   
   -- Report progress every 10 epochs
-  if (101 - epochs) `mod` 10 == 0
+  if epochs `mod` 10 == 0
     then do
       let sampleQ = runDQNNetwork newNet (vector [0.0, 0.0, 0.0, 0.0])
       let mseLoss = averageMSELoss newNet gamma trajectory
